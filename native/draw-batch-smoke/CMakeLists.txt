@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.21)
+project(kotlin_display_draw_batch_smoke LANGUAGES C)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+add_executable(draw_batch_smoke ../src/draw_batch.c ../tests/draw_batch_smoke.c)
+target_include_directories(draw_batch_smoke PRIVATE ../include)
+include(CTest)
+add_test(NAME draw_batch_smoke COMMAND draw_batch_smoke)
