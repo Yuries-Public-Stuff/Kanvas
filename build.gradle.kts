@@ -14,10 +14,11 @@ allprojects {
 
 tasks.register("testAllJvm") {
     group = "verification"
-    description = "Runs all JVM/Kotlin unit tests."
+    description = "Runs all JVM/Kotlin unit tests and compiles the demo."
     dependsOn(
         ":renderer:jvmTest",
         ":compose-bridge:test",
         ":integration-agent:test",
+        ":compose-gpu-demo:classes",
     )
 }
