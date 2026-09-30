@@ -13,5 +13,6 @@ include(":integration-agent")
 
 include(":compose-bridge")
 
+include(":compose-gpu-demo")
 
 include(":gradle-plugin")
