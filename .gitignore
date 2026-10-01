@@ -1,0 +1,11 @@
+.gradle/
+build/
+**/build/
+.idea/
+*.iml
+.DS_Store
+
+# Local macOS build environment
+.kotlin-display-macos.env
+.vscode/settings.json
+/native/build-release-check
