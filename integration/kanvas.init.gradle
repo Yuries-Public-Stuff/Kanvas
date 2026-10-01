@@ -1,0 +1,578 @@
+// Gradle integration for external projects.
+def property = { String name, String legacy, String fallback = "" ->
+    System.getProperty(name, System.getProperty(legacy, fallback))
+}
+
+def kanvasHome = property("kanvas.home", "kotlin.display.home")
+def kanvasBackend = property("kanvas.backend", "kotlin.display.backend", "auto")
+def kanvasTarget = property("kanvas.target", "kotlin.display.target")
+def kanvasRequestedBuildTask = property("kanvas.buildTask", "kotlin.display.buildTask")
+def kanvasRequestedRunTask = property("kanvas.runTask", "kotlin.display.runTask")
+def kanvasRequestedPackageTask = property("kanvas.packageTask", "kotlin.display.packageTask")
+def kanvasAgentJar = property("kanvas.agentJar", "kotlin.display.agentJar")
+def kanvasAuditPath = property("kanvas.auditPath", "kotlin.display.auditPath")
+def kanvasCapturePath = property("kanvas.capturePath", "kotlin.display.capturePath")
+def kanvasCaptureSkiaCanvas = property("kanvas.capture", "kotlin.display.captureSkiaCanvas", "true")
+def kanvasStrictRenderer = property("kanvas.strictRenderer", "kotlin.display.strictDefaultRenderer", "false")
+def kanvasTakeover = property("kanvas.takeover", "kotlin.display.takeover", "true")
+
+if (kanvasHome == null || kanvasHome.trim().isEmpty()) {
+    throw new GradleException("kanvas.home is required; use the Kanvas project adapter")
+}
+
+gradle.beforeProject { project ->
+    project.tasks.withType(JavaExec).configureEach { task ->
+        task.environment("KANVAS_HOME", kanvasHome)
+        task.environment("KANVAS_BACKEND", kanvasBackend)
+        task.environment("KD_BACKEND", kanvasBackend)
+
+        task.systemProperty("kanvas.home", kanvasHome)
+        task.systemProperty("kanvas.backend", kanvasBackend)
+
+        // Legacy runtime keys.
+        task.systemProperty("kotlin.display.home", kanvasHome)
+        task.systemProperty("kotlin.display.backend", kanvasBackend)
+
+        if (!kanvasAgentJar.isEmpty()) {
+            task.jvmArgs("-javaagent:" + kanvasAgentJar)
+
+            task.systemProperty("kanvas.auditPath", kanvasAuditPath)
+            task.systemProperty("kanvas.capturePath", kanvasCapturePath)
+            task.systemProperty("kanvas.capture", kanvasCaptureSkiaCanvas)
+            task.systemProperty("kanvas.strictRenderer", kanvasStrictRenderer)
+            task.systemProperty("kanvas.takeover", kanvasTakeover)
+
+            task.systemProperty("kotlin.display.auditPath", kanvasAuditPath)
+            task.systemProperty("kotlin.display.capturePath", kanvasCapturePath)
+            task.systemProperty("kotlin.display.captureSkiaCanvas", kanvasCaptureSkiaCanvas)
+            task.systemProperty("kotlin.display.strictDefaultRenderer", kanvasStrictRenderer)
+            task.systemProperty("kotlin.display.takeover", kanvasTakeover)
+        }
+    }
+}
+
+gradle.projectsEvaluated {
+    def root = gradle.rootProject
+
+    def taskByPath = { String path ->
+        if (path == null || path.trim().isEmpty()) return null
+        try {
+            return root.tasks.getByPath(path)
+        } catch (UnknownTaskException ignored) {
+            return null
+        }
+    }
+
+    def allTasks = root.allprojects.collectMany { p -> p.tasks.toList() }
+
+    def chooseBuild = {
+        if (!kanvasRequestedBuildTask.isEmpty()) {
+            def explicit = taskByPath(kanvasRequestedBuildTask)
+            if (explicit == null) throw new GradleException("Requested build task not found: " + kanvasRequestedBuildTask)
+            return explicit
+        }
+        if (!kanvasTarget.isEmpty()) {
+            def targetTask = taskByPath(kanvasTarget + ":build")
+            if (targetTask != null) return targetTask
+            targetTask = taskByPath(kanvasTarget + ":assemble")
+            if (targetTask != null) return targetTask
+            throw new GradleException("No build/assemble task found for target " + kanvasTarget)
+        }
+        for (def preferred : [":desktop:build", ":composeApp:build", ":app:build", ":build"]) {
+            def task = taskByPath(preferred)
+            if (task != null) return task
+        }
+        def candidate = allTasks.find { it.name == "build" } ?: allTasks.find { it.name == "assemble" }
+        if (candidate == null) throw new GradleException("No Gradle build or assemble task was found")
+        return candidate
+    }
+
+    def chooseRun = {
+        if (!kanvasRequestedRunTask.isEmpty()) {
+            def explicit = taskByPath(kanvasRequestedRunTask)
+            if (explicit == null) throw new GradleException("Requested run task not found: " + kanvasRequestedRunTask)
+            return explicit
+        }
+        if (!kanvasTarget.isEmpty()) {
+            for (def suffix : [":run", ":runDistributable"]) {
+                def targetTask = taskByPath(kanvasTarget + suffix)
+                if (targetTask != null) return targetTask
+            }
+        }
+        for (def preferred : [":desktop:run", ":composeApp:run", ":run"]) {
+            def task = taskByPath(preferred)
+            if (task != null) return task
+        }
+        return allTasks.find { it.name == "run" && it instanceof JavaExec }
+    }
+
+    def choosePackage = {
+        if (!kanvasRequestedPackageTask.isEmpty()) {
+            def explicit = taskByPath(kanvasRequestedPackageTask)
+            if (explicit == null) {
+                throw new GradleException(
+                    "Requested package task not found: " +
+                    kanvasRequestedPackageTask
+                )
+            }
+            return explicit
+        }
+
+        if (!kanvasTarget.isEmpty()) {
+            def targetTask = taskByPath(
+                kanvasTarget + ":createDistributable"
+            )
+            if (targetTask != null) return targetTask
+        }
+
+        for (def preferred : [
+            ":desktop:createDistributable",
+            ":composeApp:createDistributable",
+            ":app:createDistributable",
+            ":createDistributable"
+        ]) {
+            def task = taskByPath(preferred)
+            if (task != null) return task
+        }
+
+        return allTasks.find {
+            it.name == "createDistributable"
+        }
+    }
+
+    def projectFacts = {
+        def kotlinProjects = root.allprojects.findAll { p ->
+            p.plugins.hasPlugin("org.jetbrains.kotlin.jvm") ||
+            p.plugins.hasPlugin("org.jetbrains.kotlin.multiplatform") ||
+            p.plugins.hasPlugin("org.jetbrains.kotlin.android")
+        }
+        def composeProjects = root.allprojects.findAll { p ->
+            p.plugins.hasPlugin("org.jetbrains.compose") ||
+            p.plugins.hasPlugin("org.jetbrains.kotlin.plugin.compose")
+        }
+        def appProjects = root.allprojects.findAll { p ->
+            p.plugins.hasPlugin("application") ||
+            p.plugins.hasPlugin("com.android.application") ||
+            p.tasks.findByName("run") != null
+        }
+        return [kotlinProjects, composeProjects, appProjects]
+    }
+
+    if (root.tasks.findByName("kanvasDoctor") == null) {
+        root.tasks.register("kanvasDoctor") {
+            group = "kanvas"
+            description = "Inspect this repository for Kanvas build/run integration."
+            doLast {
+                def facts = projectFacts()
+                def buildTask = chooseBuild()
+                def runTask = chooseRun()
+                def packageTask = choosePackage()
+                println("")
+                println("Kanvas project adapter")
+                println("------------------------------")
+                println("Repository : " + root.projectDir)
+                println("Kanvas home: " + kanvasHome)
+                println("Backend    : " + kanvasBackend)
+                println("Kotlin     : " + (facts[0].isEmpty() ? "not detected" : facts[0]*.path.join(", ")))
+                println("Compose    : " + (facts[1].isEmpty() ? "not detected" : facts[1]*.path.join(", ")))
+                println("App/run    : " + (facts[2].isEmpty() ? "not detected" : facts[2]*.path.join(", ")))
+                println("Build task : " + buildTask.path)
+                println("Run task   : " + (runTask == null ? "not found" : runTask.path))
+                println("Package    : " + (packageTask == null ? "not found" : packageTask.path))
+                println("Audit      : " + (kanvasAgentJar.isEmpty() ? "off" : ("on -> " + kanvasAuditPath)))
+                println("Capture    : " + (kanvasCapturePath.isEmpty() ? "off" : kanvasCapturePath))
+                println("Strict     : " + kanvasStrictRenderer)
+                println("Takeover   : " + kanvasTakeover)
+                println("")
+                if (!facts[1].isEmpty()) {
+                    println("Compose project detected. Build/run task injection is active.")
+                    println("Run mode can intercept supported Skia Canvas draws and present them")
+                    println("through Kanvas' native GPU backend without editing the app.")
+                } else {
+                    println("Plain Kotlin project detected/accepted. Visual output uses Kanvas")
+                    println("only when the application routes drawing through the Kanvas runtime.")
+                }
+            }
+        }
+    }
+
+
+    if (root.tasks.findByName("kanvasCompatibility") == null) {
+        root.tasks.register("kanvasCompatibility") {
+            group = "kanvas"
+            description = "Report Compose/Skiko dependencies relevant to renderer replacement."
+            doLast {
+                def rows = []
+                root.allprojects.each { p ->
+                    p.configurations.findAll { cfg ->
+                        cfg.canBeResolved && (
+                            cfg.name.toLowerCase().contains("runtimeclasspath") ||
+                            cfg.name.toLowerCase().contains("compileclasspath")
+                        )
+                    }.each { cfg ->
+                        try {
+                            cfg.incoming.resolutionResult.allComponents.each { component ->
+                                def id = component.moduleVersion
+                                if (id == null) return
+                                def group = id.group ?: ""
+                                if (group.startsWith("org.jetbrains.compose") ||
+                                    group.startsWith("org.jetbrains.skiko") ||
+                                    group.startsWith("androidx.compose")) {
+                                    rows << [p.path, cfg.name, group, id.name, id.version]
+                                }
+                            }
+                        } catch (Exception ignored) {
+                            // Skip host-incompatible configurations.
+                        }
+                    }
+                }
+
+                // Check the selected JavaExec runtime classpath too.
+                try {
+                    def runTask = chooseRun()
+                    if (runTask instanceof JavaExec) {
+                        runTask.classpath.files.each { file ->
+                            def normalized = file.absolutePath.replace('\\', '/')
+                            def marker = "/modules-2/files-2.1/"
+                            def markerIndex = normalized.indexOf(marker)
+                            if (markerIndex >= 0) {
+                                def tail = normalized.substring(markerIndex + marker.length())
+                                def parts = tail.split('/')
+                                if (parts.length >= 3) {
+                                    def group = parts[0]
+                                    def name = parts[1]
+                                    def version = parts[2]
+                                    if (group.startsWith("org.jetbrains.compose") ||
+                                        group.startsWith("org.jetbrains.skiko") ||
+                                        group.startsWith("androidx.compose")) {
+                                        rows << [runTask.project.path, "javaExecRuntime", group, name, version]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {
+                    // Ignore non-JavaExec lookup failures.
+                }
+
+                rows = rows.unique().sort { a, b ->
+                    (a[2] + ":" + a[3] + ":" + a[4]) <=> (b[2] + ":" + b[3] + ":" + b[4])
+                }
+                println("")
+                println("Kanvas Compose compatibility report")
+                println("-------------------------------------------")
+                if (rows.isEmpty()) {
+                    println("No resolved Compose/Skiko desktop dependencies were found.")
+                } else {
+                    rows.each { row ->
+                        println(row[0] + " [" + row[1] + "] " + row[2] + ":" + row[3] + ":" + row[4])
+                    }
+                }
+                def composeVersions = rows.findAll { row ->
+                    row[2].startsWith("org.jetbrains.compose") ||
+                    row[2].startsWith("androidx.compose")
+                }.collect { it[4] }.findAll { it != null }.unique()
+                def rendererComposeVersions = rows.findAll { row ->
+                    (row[2] == "org.jetbrains.compose.ui" &&
+                        ["ui-desktop", "ui-graphics-desktop", "ui-text-desktop"].contains(row[3])) ||
+                    (row[2] == "org.jetbrains.compose.desktop" && row[3] == "desktop-jvm")
+                }.collect { it[4] }.findAll { it != null }.unique()
+                def skikoVersions = rows.findAll { row ->
+                    row[2].startsWith("org.jetbrains.skiko")
+                }.collect { it[4] }.findAll { it != null }.unique()
+
+                println("")
+                println("Live takeover capabilities")
+                println("--------------------------")
+                println("Canvas: clear, rect/rrect/drrect, oval/circle, points/lines/polygons,")
+                println("        arcs, paths/regions, drawPaint, images/image-nine, clipping,")
+                println("        save/layers, affine transforms and matrix state")
+                println("Text  : Paragraph.paint interception, styled runs, wrapping and Unicode")
+                println("Paint : solid RGBA, captured gradients, captured drop-shadow image filters")
+                println("Input : resize, left/right/middle pointer, move, wheel/trackpad, keyboard,")
+                println("        modifiers, Windows IME/Unicode and per-window/dialog routing")
+                println("Host  : per-Compose-window native GPU takeover; original AWT windows are")
+                println("        kept alive off-screen for Compose state/layout/input")
+                println("")
+                println("Strict-mode traps still reported deterministically at runtime:")
+                println("  custom/unknown shaders, color filters, path effects, mask filters,")
+                println("  custom blenders/non-SRC_OVER modes, backdrop filters, and Canvas")
+                println("  operations not explicitly intercepted by the installed Skiko API.")
+                println("")
+                println("Source-verified Skiko interception ABIs: 0.9.4.2, 0.144.6")
+                println("Source-verified Compose renderer lines: 1.8.2, 1.11.1")
+                println("Detected Compose versions: " +
+                    (composeVersions.isEmpty() ? "none" : composeVersions.join(", ")))
+                println("Detected renderer Compose versions: " +
+                    (rendererComposeVersions.isEmpty() ? "none" : rendererComposeVersions.join(", ")))
+                println("Detected Skiko versions: " +
+                    (skikoVersions.isEmpty() ? "none" : skikoVersions.join(", ")))
+
+                if (kanvasStrictRenderer.toBoolean()) {
+                    def supportedCompose = ["1.8.2", "1.11.1"] as Set
+                    def unsupportedCompose = rendererComposeVersions.findAll { version ->
+                        !supportedCompose.contains(version)
+                    }
+                    if (!unsupportedCompose.isEmpty()) {
+                        throw new GradleException(
+                            "Strict Kanvas takeover has source-verified renderer hooks for " +
+                            "Compose renderer lines 1.8.2 and 1.11.1; detected unsupported/unverified " +
+                            "renderer Compose versions: " + unsupportedCompose.join(", ")
+                        )
+                    }
+
+                    def supportedSkiko = ["0.9.4.2", "0.144.6"] as Set
+                    def unsupportedSkiko = skikoVersions.findAll { version ->
+                        !supportedSkiko.contains(version)
+                    }
+                    if (!unsupportedSkiko.isEmpty()) {
+                        throw new GradleException(
+                            "Strict Kanvas bytecode interception has source-verified ABIs for " +
+                            "Skiko 0.9.4.2 and 0.144.6; detected unsupported/unverified Skiko versions: " +
+                            unsupportedSkiko.join(", ")
+                        )
+                    }
+
+                    if (rendererComposeVersions.isEmpty() || skikoVersions.isEmpty()) {
+                        println("Runtime renderer versions will be verified by the live agent.")
+                    }
+                }
+            }
+        }
+    }
+
+    if (root.tasks.findByName("kanvasBuild") == null) {
+        root.tasks.register("kanvasBuild") {
+            group = "kanvas"
+            description = "Build the selected external Kotlin project without modifying it."
+            dependsOn(chooseBuild())
+            doFirst {
+                println("Kanvas -> external build: " + chooseBuild().path)
+            }
+        }
+    }
+
+    if (root.tasks.findByName("kanvasRun") == null) {
+        root.tasks.register("kanvasRun") {
+            group = "kanvas"
+            description = "Run the selected external Kotlin desktop application with Kanvas environment injection."
+            def runTask = chooseRun()
+
+            if (runTask != null && !kanvasAgentJar.isEmpty()) {
+                if (!(runTask instanceof JavaExec)) {
+                    throw new GradleException(
+                        "Selected desktop run task " + runTask.path + " is " +
+                        runTask.class.name + ", not JavaExec; Kanvas cannot attach the live agent."
+                    )
+                }
+
+                runTask.environment("KANVAS_HOME", kanvasHome)
+                runTask.environment("KANVAS_BACKEND", kanvasBackend)
+                runTask.environment("KD_BACKEND", kanvasBackend)
+
+                def javaHome = System.getenv("JAVA_HOME")
+                if (javaHome != null && !javaHome.trim().isEmpty()) {
+                    def javaExe = new File(
+                        javaHome,
+                        System.getProperty("os.name").toLowerCase().contains("win")
+                            ? "bin/java.exe"
+                            : "bin/java"
+                    )
+                    if (javaExe.isFile()) {
+                        runTask.executable = javaExe.absolutePath
+                    }
+                }
+
+                runTask.systemProperty("kanvas.home", kanvasHome)
+                runTask.systemProperty("kanvas.backend", kanvasBackend)
+                runTask.systemProperty("kanvas.auditPath", kanvasAuditPath)
+                runTask.systemProperty("kanvas.capturePath", kanvasCapturePath)
+                runTask.systemProperty("kanvas.capture", kanvasCaptureSkiaCanvas)
+                runTask.systemProperty("kanvas.strictRenderer", kanvasStrictRenderer)
+                runTask.systemProperty("kanvas.takeover", kanvasTakeover)
+
+                runTask.systemProperty("kotlin.display.home", kanvasHome)
+                runTask.systemProperty("kotlin.display.backend", kanvasBackend)
+                runTask.systemProperty("kotlin.display.auditPath", kanvasAuditPath)
+                runTask.systemProperty("kotlin.display.capturePath", kanvasCapturePath)
+                runTask.systemProperty("kotlin.display.captureSkiaCanvas", kanvasCaptureSkiaCanvas)
+                runTask.systemProperty("kotlin.display.strictDefaultRenderer", kanvasStrictRenderer)
+                runTask.systemProperty("kotlin.display.takeover", kanvasTakeover)
+
+                def agentArg = "-javaagent:" + kanvasAgentJar
+                def currentJvmArgs = runTask.jvmArgs ?: []
+                if (!currentJvmArgs.contains(agentArg)) {
+                    runTask.jvmArgs(agentArg)
+                }
+
+                runTask.doFirst {
+                    def effectiveJvmArgs = runTask.jvmArgs ?: []
+                    if (!effectiveJvmArgs.contains(agentArg)) {
+                        throw new GradleException(
+                            "Kanvas javaagent disappeared from " + runTask.path +
+                            " before execution. Effective JVM args: " + effectiveJvmArgs
+                        )
+                    }
+                    println("Kanvas agent attached to " + runTask.path)
+                    println("Kanvas agent jar: " + kanvasAgentJar)
+                    println("Kanvas audit: " + kanvasAuditPath)
+                    println("Kanvas JVM: " + runTask.executable)
+                }
+            }
+
+            if (runTask == null) {
+                doFirst { throw new GradleException("No runnable JVM/desktop task was found. Pass --run-task to kanvas-project.") }
+            } else {
+                if (kanvasStrictRenderer.toBoolean()) {
+                    def compatibilityTask = root.tasks.named("kanvasCompatibility")
+                    dependsOn(compatibilityTask)
+                    runTask.mustRunAfter(compatibilityTask)
+                }
+                dependsOn(runTask)
+                doFirst {
+                    println("Kanvas -> external run: " + runTask.path + " (backend=" + kanvasBackend + ")")
+                }
+            }
+        }
+    }
+    if (root.tasks.findByName("kanvasPackage") == null) {
+        root.tasks.register("kanvasPackage") {
+            group = "kanvas"
+            description = "Build a Compose Desktop app image with Kanvas embedded."
+
+            def packageTask = choosePackage()
+            if (packageTask == null) {
+                doFirst {
+                    throw new GradleException(
+                        "No Compose Desktop packaging task was found. " +
+                        "Pass --package-task."
+                    )
+                }
+            } else {
+                dependsOn(packageTask)
+                doLast {
+                    if (kanvasAgentJar.isEmpty()) {
+                        throw new GradleException(
+                            "kanvas.agentJar is required for package embedding."
+                        )
+                    }
+
+                    def os = System.getProperty("os.name").toLowerCase()
+                    def nativeNames = os.contains("win")
+                        ? ["kanvas_native.dll", "kotlin_display_native.dll"]
+                        : os.contains("mac")
+                            ? ["libkanvas_native.dylib", "libkotlin_display_native.dylib"]
+                            : ["libkanvas_native.so", "libkotlin_display_native.so"]
+
+                    def nativeRoot = new File(kanvasHome, "native/build")
+                    def nativeFile = null
+                    if (nativeRoot.exists()) {
+                        nativeRoot.eachFileRecurse(
+                            groovy.io.FileType.FILES
+                        ) { file ->
+                            if (nativeFile == null &&
+                                nativeNames.contains(file.name)) {
+                                nativeFile = file
+                            }
+                        }
+                    }
+
+                    if (nativeFile == null || !nativeFile.isFile()) {
+                        throw new GradleException(
+                            "Kanvas native library not found under " +
+                            nativeRoot
+                        )
+                    }
+
+                    def buildDir = packageTask.project.layout.buildDirectory
+                        .get().asFile
+                    def cfgFiles = []
+                    buildDir.eachFileRecurse(groovy.io.FileType.FILES) { file ->
+                        def normalized = file.absolutePath.replace('\\', '/')
+                        if (file.name.endsWith(".cfg") &&
+                            normalized.contains("/compose/binaries/main/app/")) {
+                            cfgFiles << file
+                        }
+                    }
+
+                    if (cfgFiles.isEmpty()) {
+                        throw new GradleException(
+                            "Kanvas could not find the Compose app image under " +
+                            buildDir
+                        )
+                    }
+
+                    cfgFiles.each { cfg ->
+                        def appLib = cfg.parentFile
+                        def kanvasDir = new File(appLib, "kanvas")
+                        kanvasDir.mkdirs()
+
+                        new File(kanvasAgentJar).withInputStream { input ->
+                            new File(kanvasDir, "kanvas-agent.jar")
+                                .withOutputStream { output ->
+                                    output << input
+                                }
+                        }
+                        nativeFile.withInputStream { input ->
+                            new File(kanvasDir, nativeFile.name)
+                                .withOutputStream { output ->
+                                    output << input
+                                }
+                        }
+
+                        def options = [
+                            'java-options=-javaagent:$APPDIR/kanvas/kanvas-agent.jar',
+                            'java-options=-Dkanvas.nativeLibrary=$APPDIR/kanvas/' +
+                                nativeFile.name,
+                            "java-options=-Dkanvas.backend=" + kanvasBackend,
+                            "java-options=-Dkanvas.takeover=" + kanvasTakeover,
+                            "java-options=-Dkanvas.capture=" + kanvasCaptureSkiaCanvas,
+                            "java-options=-Dkanvas.strictRenderer=" + kanvasStrictRenderer
+                        ]
+
+                        def lines = cfg.readLines().findAll { line ->
+                            !line.contains("/kanvas/kanvas-agent.jar") &&
+                            !line.contains("-Dkanvas.")
+                        }
+
+                        def index = lines.findIndexOf {
+                            it.trim() == "[JavaOptions]"
+                        }
+                        if (index >= 0) {
+                            lines.addAll(index + 1, options)
+                        } else {
+                            if (!lines.isEmpty() &&
+                                !lines.last().trim().isEmpty()) {
+                                lines << ""
+                            }
+                            lines << "[JavaOptions]"
+                            lines.addAll(options)
+                        }
+
+                        cfg.text =
+                            lines.join(System.lineSeparator()) +
+                            System.lineSeparator()
+                        println("Kanvas package -> " + cfg.parentFile)
+                    }
+                }
+            }
+        }
+    }
+
+    [
+        "kdDoctor": "kanvasDoctor",
+        "kdCompatibility": "kanvasCompatibility",
+        "kdBuild": "kanvasBuild",
+        "kdRun": "kanvasRun",
+        "kdPackage": "kanvasPackage"
+    ].each { oldName, newName ->
+        if (root.tasks.findByName(oldName) == null) {
+            root.tasks.register(oldName) {
+                group = "kanvas"
+                description = "Legacy alias for " + newName + "."
+                dependsOn(root.tasks.named(newName))
+            }
+        }
+    }
+
+}
