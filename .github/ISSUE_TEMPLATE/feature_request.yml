@@ -1,0 +1,44 @@
+name: Feature request
+description: Suggest an improvement to Kanvas
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the use case before describing the implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should Kanvas do?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Gradle plugin
+        - Compose integration
+        - Rendering
+        - Native backend
+        - Input / windowing
+        - Packaging
+        - Diagnostics
+        - Documentation
+        - Other
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional. Include workarounds or other approaches you considered.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, screenshots, examples, or related projects are welcome.
