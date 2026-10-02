@@ -1,0 +1,124 @@
+name: Bug report
+description: Report a reproducible Kanvas build, runtime, packaging, or rendering problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a Kanvas bug. Please include enough information for someone else to reproduce it.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Gradle plugin
+        - Build / setup
+        - Runtime / launch
+        - Rendering
+        - Input / window behavior
+        - Packaging
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How can we reproduce it?
+      description: Include commands, project layout, and the smallest useful reproduction steps.
+      placeholder: |
+        1. Apply Kanvas to :desktop
+        2. Run ./gradlew kanvasRun
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: repository
+    attributes:
+      label: Reproduction repository
+      description: Link the affected repository if possible. If it cannot be shared, link or describe a minimal project that reproduces the same functionality.
+      placeholder: https://github.com/example/project
+  - type: textarea
+    id: equivalent
+    attributes:
+      label: Equivalent test case
+      description: If the original repository cannot be shared, explain how we can test the same functionality and reproduce the same failure.
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15.1 / Windows 11 / Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: arch
+    attributes:
+      label: CPU architecture
+      placeholder: arm64 / x86_64
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: Apple M-series GPU / NVIDIA RTX ... / AMD ...
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Kanvas backend
+      options:
+        - auto
+        - metal
+        - vulkan
+        - opengl
+        - d3d9
+        - gdi
+        - unknown / not applicable
+    validations:
+      required: true
+  - type: input
+    id: jdk
+    attributes:
+      label: JDK version
+      placeholder: 17 / 21
+  - type: input
+    id: kotlin
+    attributes:
+      label: Kotlin version
+  - type: input
+    id: compose
+    attributes:
+      label: Compose Desktop version
+  - type: input
+    id: skiko
+    attributes:
+      label: Skiko version
+      description: Leave blank if you do not know it.
+  - type: input
+    id: kanvas
+    attributes:
+      label: Kanvas version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste the relevant error output or renderer-audit.log. Use a code block for long text.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I ran kanvasDoctor.
+        - label: I ran kanvasCompatibility.
+        - label: I searched existing issues for the same problem.
