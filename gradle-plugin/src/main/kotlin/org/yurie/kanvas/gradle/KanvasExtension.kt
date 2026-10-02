@@ -7,7 +7,7 @@ open class KanvasExtension {
 
     var sourceUrl: String = System.getProperty(
         "kanvas.sourceUrl",
-        "https://github.com/Yur-ie/kotlin-display-but-fucked-and-suicidal.git"
+        "https://github.com/Yuries-Public-Stuff/Kanvas.git"
     )
 
     var sourceRef: String = System.getProperty(
