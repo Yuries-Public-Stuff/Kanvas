@@ -1,0 +1,38 @@
+name: Question / support
+description: Ask for help using or configuring Kanvas
+title: "[Question]: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please run kanvasDoctor and kanvasCompatibility first, then include the repository or a minimal equivalent when possible.
+  - type: textarea
+    id: question
+    attributes:
+      label: What are you trying to do?
+      description: Describe the goal and where you are stuck.
+    validations:
+      required: true
+  - type: input
+    id: repository
+    attributes:
+      label: Repository or reproduction
+      description: Link the project if possible, or a minimal project that exercises the same setup.
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: JDK / Kotlin / Compose versions
+      placeholder: JDK 17, Kotlin 2.4.20, Compose 1.8.2
+  - type: textarea
+    id: doctor
+    attributes:
+      label: kanvasDoctor / kanvasCompatibility output
+      description: Paste the relevant output in a code block.
