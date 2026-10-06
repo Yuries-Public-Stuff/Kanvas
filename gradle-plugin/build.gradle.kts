@@ -1,3 +1,5 @@
+import org.gradle.plugin.compatibility.compatibility
+
 plugins {
     id("com.gradle.plugin-publish") version "2.2.1"
     kotlin("jvm") version "2.4.20"
@@ -16,8 +18,8 @@ repositories {
 }
 
 gradlePlugin {
-    website.set("https://yurie.org")
-    vcsUrl.set("https://github.com/Yur-ie/kotlin-display-but-fucked-and-suicidal")
+    website.set("https://github.com/Yuries-Public-Stuff/Kanvas")
+    vcsUrl.set("https://github.com/Yuries-Public-Stuff/Kanvas.git")
 
     plugins {
         create("kanvas") {
@@ -36,6 +38,13 @@ gradlePlugin {
                     "metal"
                 )
             )
+
+            compatibility {
+                features {
+                    configurationCache = false
+                    isolatedProjects = false
+                }
+            }
         }
     }
 }
