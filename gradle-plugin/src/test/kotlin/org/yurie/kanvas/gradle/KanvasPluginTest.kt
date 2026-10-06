@@ -39,8 +39,34 @@ class KanvasPluginTest {
             result.task(":kanvasDoctor")?.outcome
         )
         assertTrue(result.output.contains("Kanvas"))
-        assertTrue(result.output.contains("Build task : :build"))
-        assertTrue(result.output.contains("Run task   : :run"))
+        assertTrue(result.output.contains("[OK] Build task: :build"))
+        assertTrue(result.output.contains("[OK] Run task: :run"))
+        assertTrue(result.output.contains("Summary:"))
+    }
+
+    @Test
+    fun `root target resolves normal root task paths`() {
+        writeProject(
+            """
+            plugins {
+                java
+                id("org.yurie.kanvas")
+            }
+
+            kanvas {
+                target = ":"
+                autoBuildRuntime = false
+            }
+            """.trimIndent()
+        )
+
+        val result = runner("kanvasBuild").build()
+
+        assertEquals(
+            TaskOutcome.SUCCESS,
+            result.task(":kanvasBuild")?.outcome
+        )
+        assertTrue(result.task(":build") != null)
     }
 
     @Test
@@ -68,6 +94,33 @@ class KanvasPluginTest {
     }
 
     @Test
+    fun `doctor fails on missing manual runtime artifact`() {
+        writeProject(
+            """
+            plugins {
+                java
+                application
+                id("org.yurie.kanvas")
+            }
+
+            application {
+                mainClass.set("example.Main")
+            }
+
+            kanvas {
+                autoBuildRuntime = false
+                agentJar = "missing-kanvas-agent.jar"
+            }
+            """.trimIndent()
+        )
+
+        val result = runner("kanvasDoctor").buildAndFail()
+
+        assertTrue(result.output.contains("[ERROR] Agent JAR:"))
+        assertTrue(result.output.contains("blocking problem"))
+    }
+
+    @Test
     fun `invalid backend is rejected`() {
         writeProject(
             """
@@ -89,7 +142,6 @@ class KanvasPluginTest {
             result.output.contains("Unsupported Kanvas backend 'potato'")
         )
     }
-
 
     @Test
     fun `kanvasPackage embeds runtime in Compose app image`() {
@@ -151,9 +203,9 @@ class KanvasPluginTest {
             "build/compose/binaries/main/app/Test/lib/app"
         )
         assertTrue(File(app, "kanvas/kanvas-agent.jar").isFile)
-        assertTrue(
-            File(app, "kanvas/$nativeName").isFile
-        )
+        assertTrue(File(app, "kanvas/$nativeName").isFile)
+        assertTrue(File(app, "kanvas/LICENSE").isFile)
+        assertTrue(File(app, "kanvas/THIRD_PARTY_NOTICES.md").isFile)
 
         val cfg = File(app, "Test.cfg").readText()
         assertTrue(
@@ -165,6 +217,72 @@ class KanvasPluginTest {
         assertTrue(cfg.contains("-Dkanvas.strictRenderer=true"))
     }
 
+    @Test
+    fun `kanvasPackage copies license notices from Kanvas home`() {
+        val home = File(projectDir, "kanvas-home")
+        val agentDir = File(home, "integration-agent/build/libs")
+        val nativeDir = File(home, "native/build")
+        agentDir.mkdirs()
+        nativeDir.mkdirs()
+
+        val nativeName = when {
+            System.getProperty("os.name").lowercase().contains("win") ->
+                "kanvas_native.dll"
+            System.getProperty("os.name").lowercase().contains("mac") ->
+                "libkanvas_native.dylib"
+            else -> "libkanvas_native.so"
+        }
+
+        File(agentDir, "kanvas-agent.jar").writeText("agent")
+        File(nativeDir, nativeName).writeText("native")
+        File(home, "LICENSE").writeText("license")
+        File(home, "THIRD_PARTY_NOTICES.md").writeText("notices")
+
+        writeProject(
+            """
+            plugins {
+                id("org.yurie.kanvas")
+            }
+
+            tasks.register("createDistributable") {
+                doLast {
+                    val app = layout.buildDirectory.dir(
+                        "compose/binaries/main/app/Test/lib/app"
+                    ).get().asFile
+                    app.mkdirs()
+                    file("${'$'}{app}/Test.cfg").writeText(
+                        "[JavaOptions]\njava-options=-Xmx512m\n"
+                    )
+                }
+            }
+
+            kanvas {
+                autoBuildRuntime = false
+                home = "${home.invariantSeparatorsPath}"
+                packageTask = ":createDistributable"
+            }
+            """.trimIndent()
+        )
+
+        val result = runner("kanvasPackage").build()
+
+        assertEquals(
+            TaskOutcome.SUCCESS,
+            result.task(":kanvasPackage")?.outcome
+        )
+
+        val kanvas = File(
+            projectDir,
+            "build/compose/binaries/main/app/Test/lib/app/kanvas"
+        )
+        assertTrue(File(kanvas, "kanvas-agent.jar").isFile)
+        assertTrue(File(kanvas, nativeName).isFile)
+        assertEquals("license", File(kanvas, "LICENSE").readText())
+        assertEquals(
+            "notices",
+            File(kanvas, "THIRD_PARTY_NOTICES.md").readText()
+        )
+    }
 
     @Test
     fun `direct package task is patched too`() {
