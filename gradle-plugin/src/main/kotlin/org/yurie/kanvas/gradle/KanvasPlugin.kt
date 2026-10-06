@@ -11,6 +11,23 @@ import java.security.MessageDigest
 import java.util.Locale
 
 class KanvasPlugin : Plugin<Project> {
+    companion object {
+        private const val BASELINE_COMPOSE = "1.8.2"
+        private const val BASELINE_SKIKO = "0.9.4.2"
+        private const val MIN_GRADLE = "7.6.3"
+        private const val MAX_TESTED_GRADLE = "9.8.0"
+        private const val MIN_CMAKE = "3.21"
+    }
+
+    private enum class DoctorLevel { OK, WARN, ERROR }
+
+    private data class DoctorCheck(
+        val level: DoctorLevel,
+        val name: String,
+        val detail: String,
+        val fix: String? = null
+    )
+
     override fun apply(project: Project) {
         require(project == project.rootProject) {
             "Apply org.yurie.kanvas to the root project."
@@ -53,7 +70,7 @@ class KanvasPlugin : Plugin<Project> {
 
         val doctor = project.tasks.register("kanvasDoctor") { task ->
             task.group = "kanvas"
-            task.description = "Show the app tasks and Kanvas runtime configuration."
+            task.description = "Diagnose Kanvas configuration, toolchain, platform, runtime, and app integration."
         }
 
         val compatibility = project.tasks.register("kanvasCompatibility") { task ->
@@ -109,36 +126,13 @@ class KanvasPlugin : Plugin<Project> {
 
             doctor.configure { task ->
                 task.doLast {
-                    project.logger.lifecycle("")
-                    project.logger.lifecycle("Kanvas")
-                    project.logger.lifecycle("------")
-                    project.logger.lifecycle("Backend    : {}", extension.backend)
-                    project.logger.lifecycle("Target     : {}", extension.target.ifBlank { "auto" })
-                    project.logger.lifecycle(
-                        "Build task : {}",
-                        buildTask?.path ?: "not found"
+                    runDoctor(
+                        project,
+                        extension,
+                        buildTask,
+                        runTask,
+                        packageTask
                     )
-                    project.logger.lifecycle("Run task   : {}", runTask?.path ?: "not found")
-                    project.logger.lifecycle(
-                        "Package    : {}",
-                        packageTask?.path ?: "not found"
-                    )
-                    project.logger.lifecycle(
-                        "Home       : {}",
-                        extension.home.ifBlank { "auto" }
-                    )
-                    if (extension.home.isBlank()) {
-                        project.logger.lifecycle(
-                            "Source     : {} @ {}",
-                            extension.sourceUrl,
-                            effectiveSourceRef(extension)
-                        )
-                    }
-                    project.logger.lifecycle("Runtime    : {}", if (extension.autoBuildRuntime) "auto" else "manual")
-                    project.logger.lifecycle("Build type : {}", extension.runtimeBuildType)
-                    project.logger.lifecycle("Strict     : {}", extension.strictRenderer)
-                    printToolchain(project)
-                    project.logger.lifecycle("")
                 }
             }
 
@@ -207,8 +201,8 @@ class KanvasPlugin : Plugin<Project> {
         explicitTask(root, extension.buildTask)?.let { return it }
 
         if (extension.target.isNotBlank()) {
-            task(root, "${extension.target}:build")?.let { return it }
-            task(root, "${extension.target}:assemble")?.let { return it }
+            task(root, targetTaskPath(extension.target, "build"))?.let { return it }
+            task(root, targetTaskPath(extension.target, "assemble"))?.let { return it }
             return null
         }
 
@@ -232,7 +226,7 @@ class KanvasPlugin : Plugin<Project> {
 
         if (extension.target.isNotBlank()) {
             listOf("run", "runDistributable").forEach { name ->
-                task(root, "${extension.target}:$name")?.let { return it }
+                task(root, targetTaskPath(extension.target, name))?.let { return it }
             }
         }
 
@@ -259,7 +253,7 @@ class KanvasPlugin : Plugin<Project> {
         if (extension.target.isNotBlank()) {
             task(
                 root,
-                "${extension.target}:createDistributable"
+                targetTaskPath(extension.target, "createDistributable")
             )?.let { return it }
         }
 
@@ -317,7 +311,7 @@ class KanvasPlugin : Plugin<Project> {
             }
 
             val agentArg = "-javaagent:${agent.absolutePath}"
-            if (!(task.jvmArgs ?: emptyList<String>()).contains(agentArg)) {
+            if (!task.jvmArgs.contains(agentArg)) {
                 task.jvmArgs(agentArg)
             }
 
@@ -668,6 +662,10 @@ class KanvasPlugin : Plugin<Project> {
             agent.copyTo(File(kanvasDir, "kanvas-agent.jar"), overwrite = true)
             native.copyTo(File(kanvasDir, native.name), overwrite = true)
 
+            listOf("LICENSE", "THIRD_PARTY_NOTICES.md").forEach { name ->
+                copyPackagedNotice(home, kanvasDir, name)
+            }
+
             patchLauncherConfig(cfg, native.name, extension)
 
             root.logger.lifecycle(
@@ -757,6 +755,11 @@ class KanvasPlugin : Plugin<Project> {
         return os.contains("mac") || os.contains("darwin")
     }
 
+    private fun isLinux(): Boolean =
+        System.getProperty("os.name")
+            .lowercase(Locale.ROOT)
+            .contains("linux")
+
     private fun gradleExecutable(root: Project): File {
         val home = root.gradle.gradleHomeDir
             ?: throw GradleException("Gradle home is unavailable.")
@@ -822,62 +825,681 @@ class KanvasPlugin : Plugin<Project> {
         }
     }
 
-    private fun printToolchain(root: Project) {
-        val compiler = if (isWindows()) "gcc" else "cc"
-        val builder = when {
-            commandAvailable("ninja") -> "ninja"
-            isWindows() && commandAvailable("mingw32-make") -> "mingw32-make"
-            commandAvailable("make") -> "make"
-            else -> null
+    private fun targetTaskPath(target: String, taskName: String): String {
+        val normalized = target.trim().trimEnd(':')
+        return if (normalized.isEmpty()) {
+            ":$taskName"
+        } else if (normalized.startsWith(":")) {
+            "$normalized:$taskName"
+        } else {
+            ":$normalized:$taskName"
         }
-
-        root.logger.lifecycle(
-            "Tools      : git={} cmake={} java={} {}={} builder={}",
-            status(commandAvailable("git")),
-            status(commandAvailable("cmake")),
-            status(commandAvailable("java")),
-            compiler,
-            status(commandAvailable(compiler)),
-            builder ?: "missing"
-        )
     }
 
-    private fun status(value: Boolean): String =
-        if (value) "ok" else "missing"
+    private fun runDoctor(
+        root: Project,
+        extension: KanvasExtension,
+        buildTask: Task?,
+        runTask: Task?,
+        packageTask: Task?
+    ) {
+        val checks = mutableListOf<DoctorCheck>()
+
+        fun ok(name: String, detail: String) {
+            checks += DoctorCheck(DoctorLevel.OK, name, detail)
+        }
+        fun warn(name: String, detail: String, fix: String? = null) {
+            checks += DoctorCheck(DoctorLevel.WARN, name, detail, fix)
+        }
+        fun error(name: String, detail: String, fix: String? = null) {
+            checks += DoctorCheck(DoctorLevel.ERROR, name, detail, fix)
+        }
+
+        val osName = System.getProperty("os.name")
+        val osArch = System.getProperty("os.arch")
+        val gradleJavaVersion = System.getProperty("java.version")
+        val javaSpec = System.getProperty("java.specification.version")
+        val javaMajor = javaSpec.substringAfterLast('.').toIntOrNull() ?: 0
+        val gradleJavaHome = File(System.getProperty("java.home"))
+        val envJavaHome = System.getenv("JAVA_HOME")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let(::File)
+        val appJavaHome = envJavaHome ?: gradleJavaHome
+        val jniHome = listOfNotNull(appJavaHome, appJavaHome.parentFile)
+            .firstOrNull { File(it, "include/jni.h").isFile }
+        val appJavaVersion = javaVersionFromHome(appJavaHome)
+
+        ok("Host", "$osName / $osArch")
+
+        val gradleVersion = org.gradle.util.GradleVersion.current()
+        val minGradle = org.gradle.util.GradleVersion.version(MIN_GRADLE)
+        val maxGradle = org.gradle.util.GradleVersion.version(MAX_TESTED_GRADLE)
+        when {
+            gradleVersion < minGradle -> error(
+                "Gradle",
+                "$gradleVersion is below the Kotlin 2.4.20 baseline.",
+                "Use Gradle $MIN_GRADLE or newer."
+            )
+            gradleVersion > maxGradle -> warn(
+                "Gradle",
+                "$gradleVersion is newer than the fully tested Kotlin 2.4.20 range.",
+                "Prefer Gradle $MIN_GRADLE through $MAX_TESTED_GRADLE until verified."
+            )
+            else -> ok("Gradle", gradleVersion.version)
+        }
+
+        if (javaMajor < 17) {
+            error(
+                "Gradle JVM",
+                "Java $gradleJavaVersion is too old.",
+                "Run Gradle with JDK 17 or newer."
+            )
+        } else {
+            ok(
+                "Gradle JVM",
+                "Java $gradleJavaVersion (${gradleJavaHome.absolutePath})"
+            )
+        }
+
+        if (extension.autoBuildRuntime &&
+            envJavaHome != null &&
+            !File(envJavaHome, "include/jni.h").isFile) {
+            error(
+                "App JDK/JNI",
+                "${envJavaHome.absolutePath} does not contain JNI headers.",
+                "Point JAVA_HOME to a full JDK 17+ installation or unset it so Kanvas can use the active JDK."
+            )
+        } else if (jniHome == null && extension.autoBuildRuntime) {
+            error(
+                "App JDK/JNI",
+                "JNI headers were not found under ${appJavaHome.absolutePath}.",
+                "Point JAVA_HOME to a full JDK 17+ installation."
+            )
+        } else {
+            ok(
+                "App JDK/JNI",
+                "Java ${appJavaVersion ?: "unknown"} (${appJavaHome.absolutePath})" +
+                    if (envJavaHome != null) " via JAVA_HOME" else " via Gradle JVM"
+            )
+        }
+
+        val localHome = if (extension.home.isNotBlank()) {
+            File(extension.home).absoluteFile
+        } else {
+            detectLocalCheckout()
+        }
+
+        if (extension.home.isNotBlank()) {
+            val requiredHome = localHome!!
+            if (File(requiredHome, "native").isDirectory &&
+                File(requiredHome, "integration-agent").isDirectory) {
+                ok("Kanvas home", requiredHome.absolutePath)
+            } else {
+                error(
+                    "Kanvas home",
+                    "${requiredHome.absolutePath} is not a Kanvas checkout.",
+                    "Set kanvas.home/KANVAS_HOME to a checkout containing native/ and integration-agent/."
+                )
+            }
+        } else if (localHome != null) {
+            ok("Kanvas source", "local checkout: ${localHome.absolutePath}")
+        } else {
+            ok(
+                "Kanvas source",
+                "${extension.sourceUrl} @ ${effectiveSourceRef(extension)}"
+            )
+        }
+
+        if (extension.autoBuildRuntime) {
+            if (localHome == null) {
+                if (!commandAvailable("git")) {
+                    error(
+                        "Git",
+                        "Git is required to provision Kanvas source.",
+                        "Install Git or set kanvas.home to an existing checkout."
+                    )
+                } else {
+                    ok("Git", commandVersion("git") ?: "available")
+                }
+            } else if (commandAvailable("git")) {
+                ok("Git", commandVersion("git") ?: "available")
+            } else {
+                ok("Git", "not required; a local Kanvas checkout is already selected")
+            }
+
+            val cmakeLine = commandVersion("cmake")
+            if (cmakeLine == null) {
+                error("CMake", "CMake was not found.", "Install CMake $MIN_CMAKE or newer.")
+            } else {
+                val cmakeVersion = Regex("\\d+(?:\\.\\d+){1,2}")
+                    .find(cmakeLine)?.value
+                if (cmakeVersion != null && !versionAtLeast(cmakeVersion, MIN_CMAKE)) {
+                    error(
+                        "CMake",
+                        "$cmakeVersion is too old.",
+                        "Install CMake $MIN_CMAKE or newer."
+                    )
+                } else {
+                    ok("CMake", cmakeLine)
+                }
+            }
+
+            val compiler = when {
+                isWindows() -> windowsTool("gcc.exe")?.absolutePath ?: "gcc"
+                commandAvailable("cc") -> "cc"
+                commandAvailable("clang") -> "clang"
+                else -> "gcc"
+            }
+            val compilerLine = commandVersion(compiler)
+            if (compilerLine == null) {
+                error(
+                    "C compiler",
+                    "$compiler was not found.",
+                    if (isWindows()) {
+                        "Install MinGW-w64 GCC (MSYS2 UCRT64/MINGW64 is supported)."
+                    } else if (isMac()) {
+                        "Install Xcode Command Line Tools."
+                    } else {
+                        "Install a C compiler such as GCC or Clang."
+                    }
+                )
+            } else {
+                ok("C compiler", compilerLine)
+            }
+
+            val windowsMake = if (isWindows()) windowsTool("mingw32-make.exe") else null
+            val builder = when {
+                commandAvailable("ninja") -> "ninja"
+                isWindows() && windowsMake != null -> windowsMake.absolutePath
+                commandAvailable("make") -> "make"
+                else -> null
+            }
+            if (builder == null) {
+                error(
+                    "Native builder",
+                    "No supported build tool was found.",
+                    if (isWindows()) "Install Ninja or mingw32-make." else "Install Ninja or Make."
+                )
+            } else {
+                ok("Native builder", commandVersion(builder) ?: builder)
+            }
+
+            when {
+                isWindows() -> {
+                    if (!commandSucceeds(
+                            listOf(
+                                "powershell",
+                                "-NoProfile",
+                                "-Command",
+                                "\$PSVersionTable.PSVersion.ToString()"
+                            )
+                        )) {
+                        error(
+                            "PowerShell",
+                            "PowerShell was not found.",
+                            "Install/enable PowerShell or place powershell.exe on PATH."
+                        )
+                    } else {
+                        ok("PowerShell", "available")
+                    }
+                }
+                isMac() -> {
+                    if (!commandSucceeds(listOf("xcrun", "--find", "clang"))) {
+                        error(
+                            "Xcode tools",
+                            "xcrun could not find clang.",
+                            "Run xcode-select --install."
+                        )
+                    } else {
+                        ok(
+                            "Xcode tools",
+                            commandOutput(listOf("xcode-select", "-p"))?.trim() ?: "available"
+                        )
+                    }
+                }
+                isLinux() -> {
+                    if (!linuxX11DevelopmentPresent()) {
+                        error(
+                            "X11 development",
+                            "X11 development headers were not detected.",
+                            "Install your distribution's X11/Xlib development package."
+                        )
+                    } else {
+                        ok("X11 development", "detected")
+                    }
+                }
+            }
+        } else {
+            ok("Runtime build", "automatic native runtime build is disabled")
+        }
+
+        val rendererExpected = runTask is JavaExec &&
+            composeRuntimeNames(runTask).isNotEmpty()
+
+        if (!isWindows() && !isMac() && !isLinux()) {
+            error(
+                "Host platform",
+                "${System.getProperty("os.name")} is not supported.",
+                "Use Windows, macOS, or Linux."
+            )
+        }
+
+        val backend = extension.backend.lowercase(Locale.ROOT)
+        val backendProblem = backendPlatformProblem(backend)
+        if (backendProblem != null) {
+            error(
+                "Backend",
+                backendProblem,
+                "Use backend = \"auto\" or a backend implemented for this host."
+            )
+        } else {
+            ok("Backend", backendAutoDescription(backend))
+        }
+
+        if (isLinux() && (backend == "auto" || backend == "vulkan")) {
+            if (!linuxVulkanLoaderPresent()) {
+                if (rendererExpected) {
+                    error(
+                        "Vulkan loader",
+                        "libvulkan.so.1 was not detected. Linux auto mode requires Vulkan.",
+                        "Install the Vulkan loader/runtime and a working GPU driver."
+                    )
+                } else {
+                    warn(
+                        "Vulkan loader",
+                        "libvulkan.so.1 was not detected, but no Compose/Skiko renderer target was detected.",
+                        "Install Vulkan before running a supported desktop renderer."
+                    )
+                }
+            } else {
+                ok("Vulkan loader", "detected")
+            }
+        } else if (isWindows() && backend == "vulkan") {
+            if (!windowsVulkanLoaderPresent()) {
+                error(
+                    "Vulkan loader",
+                    "vulkan-1.dll/VULKAN_SDK was not detected.",
+                    "Install a Vulkan-capable GPU driver or Vulkan runtime."
+                )
+            } else {
+                ok("Vulkan loader", "detected")
+            }
+        } else if (isWindows() && backend == "auto" && !windowsVulkanLoaderPresent()) {
+            warn(
+                "Vulkan loader",
+                "Vulkan was not detected; auto mode can still fall back to D3D9/OpenGL.",
+                "Install/update the GPU driver if Vulkan is expected."
+            )
+        }
+
+        if (buildTask == null) {
+            error(
+                "Build task",
+                "No application build/assemble task was found.",
+                "Set kanvas.target or kanvas.buildTask explicitly."
+            )
+        } else {
+            ok("Build task", buildTask.path)
+        }
+
+        when {
+            runTask == null -> warn(
+                "Run task",
+                "No runnable JVM desktop task was found.",
+                "Set kanvas.target or kanvas.runTask if this project should run through Kanvas."
+            )
+            runTask !is JavaExec -> error(
+                "Run task",
+                "${runTask.path} is ${runTask.javaClass.simpleName}, not JavaExec.",
+                "Set kanvas.runTask to the JVM desktop JavaExec task."
+            )
+            else -> ok("Run task", runTask.path)
+        }
+
+        if (packageTask == null) {
+            warn(
+                "Package task",
+                "No Compose createDistributable task was found.",
+                "This is fine if packaging is not needed; otherwise set kanvas.packageTask."
+            )
+        } else {
+            ok("Package task", packageTask.path)
+        }
+
+        if (runTask is JavaExec) {
+            val runtimeNames = composeRuntimeNames(runTask)
+            if (runtimeNames.isEmpty()) {
+                warn(
+                    "Compose/Skiko",
+                    "No Compose/Skiko JARs were detected on ${runTask.path}.",
+                    "For GPU takeover, select the Compose Desktop JavaExec task."
+                )
+            } else {
+                ok("Compose/Skiko", runtimeNames.joinToString(", "))
+            }
+        }
+
+        if (!extension.autoBuildRuntime) {
+            if (extension.agentJar.isNotBlank()) {
+                val agent = File(extension.agentJar).absoluteFile
+                if (agent.isFile) {
+                    ok("Agent JAR", agent.absolutePath)
+                } else {
+                    error(
+                        "Agent JAR",
+                        "Configured agent does not exist: ${agent.absolutePath}",
+                        "Build the agent or correct kanvas.agentJar."
+                    )
+                }
+            } else if (localHome != null) {
+                val agent = resolveAgent(localHome, extension)
+                if (agent.isFile) {
+                    ok("Agent JAR", agent.absolutePath)
+                } else {
+                    warn(
+                        "Agent JAR",
+                        "No built agent was found under ${localHome.absolutePath}.",
+                        "Build :integration-agent:jar before running Kanvas."
+                    )
+                }
+            }
+
+            if (extension.nativeLibrary.isNotBlank()) {
+                val native = File(extension.nativeLibrary).absoluteFile
+                if (native.isFile) {
+                    ok("Native library", native.absolutePath)
+                } else {
+                    error(
+                        "Native library",
+                        "Configured native library does not exist: ${native.absolutePath}",
+                        "Build the native runtime or correct kanvas.nativeLibrary."
+                    )
+                }
+            } else if (localHome != null) {
+                val native = resolveNativeLibrary(localHome, extension)
+                if (native.isFile) {
+                    ok("Native library", native.absolutePath)
+                } else {
+                    warn(
+                        "Native library",
+                        "No built native runtime was found under ${localHome.absolutePath}.",
+                        "Build kanvasRuntime before running/packaging."
+                    )
+                }
+            }
+        }
+
+        root.logger.lifecycle("")
+        root.logger.lifecycle("Kanvas Doctor")
+        root.logger.lifecycle("=============")
+        root.logger.lifecycle("Requested backend : {}", extension.backend)
+        root.logger.lifecycle("Target            : {}", extension.target.ifBlank { "auto" })
+        root.logger.lifecycle(
+            "Runtime build     : {}",
+            if (extension.autoBuildRuntime) "automatic" else "manual"
+        )
+        root.logger.lifecycle("Runtime build type: {}", extension.runtimeBuildType)
+        root.logger.lifecycle("Takeover          : {}", extension.takeover)
+        root.logger.lifecycle("Capture           : {}", extension.capture)
+        root.logger.lifecycle("Audit             : {}", extension.audit)
+        root.logger.lifecycle("Strict renderer   : {}", extension.strictRenderer)
+        root.logger.lifecycle("")
+        root.logger.lifecycle("Checks")
+        root.logger.lifecycle("------")
+
+        checks.forEach { check ->
+            val tag = when (check.level) {
+                DoctorLevel.OK -> "OK"
+                DoctorLevel.WARN -> "WARN"
+                DoctorLevel.ERROR -> "ERROR"
+            }
+            root.logger.lifecycle("[{}] {}: {}", tag, check.name, check.detail)
+            check.fix?.let { root.logger.lifecycle("       Fix: {}", it) }
+        }
+
+        val errors = checks.count { it.level == DoctorLevel.ERROR }
+        val warnings = checks.count { it.level == DoctorLevel.WARN }
+        val passed = checks.count { it.level == DoctorLevel.OK }
+
+        root.logger.lifecycle("")
+        root.logger.lifecycle(
+            "Summary: {} error(s), {} warning(s), {} check(s) passed.",
+            errors,
+            warnings,
+            passed
+        )
+
+        if (errors > 0) {
+            throw GradleException(
+                "Kanvas Doctor found $errors blocking problem(s). " +
+                    "Fix the ERROR items above and run kanvasDoctor again."
+            )
+        }
+    }
+
+    private fun backendPlatformProblem(backend: String): String? {
+        if (backend == "auto") return null
+        return when {
+            isWindows() && backend in setOf("vulkan", "opengl", "d3d9", "gdi") -> null
+            isMac() && backend == "metal" -> null
+            isLinux() && backend == "vulkan" -> null
+            else -> "Backend '$backend' is not implemented for ${System.getProperty("os.name")}."
+        }
+    }
+
+    private fun backendAutoDescription(backend: String): String {
+        if (backend != "auto") return "$backend selected"
+        return when {
+            isMac() -> "auto -> Metal"
+            isLinux() -> "auto -> Vulkan"
+            isWindows() ->
+                "auto -> Vulkan, then D3D9, then OpenGL; GDI is the initial creation safety fallback"
+            else -> "auto on unsupported host"
+        }
+    }
+
+    private fun windowsTool(name: String): File? {
+        val fromPath = commandOutput(listOf("where", name))
+            ?.lineSequence()
+            ?.map { File(it.trim()) }
+            ?.firstOrNull { it.isFile }
+        if (fromPath != null) return fromPath
+
+        return listOf(
+            File("C:\\msys64\\ucrt64\\bin", name),
+            File("C:\\msys64\\mingw64\\bin", name)
+        ).firstOrNull { it.isFile }
+    }
+
+    private fun linuxX11DevelopmentPresent(): Boolean =
+        commandSucceeds(listOf("pkg-config", "--exists", "x11")) ||
+            File("/usr/include/X11/Xlib.h").isFile
+
+    private fun linuxVulkanLoaderPresent(): Boolean {
+        val common = listOf(
+            "/usr/lib/libvulkan.so.1",
+            "/usr/lib64/libvulkan.so.1",
+            "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+            "/usr/lib/aarch64-linux-gnu/libvulkan.so.1",
+            "/lib/x86_64-linux-gnu/libvulkan.so.1",
+            "/lib/aarch64-linux-gnu/libvulkan.so.1"
+        )
+        if (common.any { File(it).isFile }) return true
+        return commandOutput(listOf("ldconfig", "-p"))
+            ?.contains("libvulkan.so.1") == true
+    }
+
+    private fun windowsVulkanLoaderPresent(): Boolean {
+        if (!System.getenv("VULKAN_SDK").isNullOrBlank()) return true
+        val windir = System.getenv("WINDIR") ?: "C:\\Windows"
+        return File(windir, "System32/vulkan-1.dll").isFile
+    }
+
+    private fun versionAtLeast(current: String, required: String): Boolean {
+        val left = current.split('.').mapNotNull { it.toIntOrNull() }
+        val right = required.split('.').mapNotNull { it.toIntOrNull() }
+        val size = maxOf(left.size, right.size)
+        for (index in 0 until size) {
+            val a = left.getOrElse(index) { 0 }
+            val b = right.getOrElse(index) { 0 }
+            if (a != b) return a > b
+        }
+        return true
+    }
+
+    private fun javaVersionFromHome(home: File): String? {
+        val release = File(home, "release")
+        if (release.isFile) {
+            runCatching {
+                release.useLines { lines ->
+                    lines.firstOrNull { it.startsWith("JAVA_VERSION=") }
+                        ?.substringAfter('=')
+                        ?.trim()
+                        ?.trim('"')
+                }
+            }.getOrNull()?.let { return it }
+        }
+
+        val executable = File(
+            home,
+            if (isWindows()) "bin/java.exe" else "bin/java"
+        )
+        if (!executable.isFile) return null
+
+        val output = commandOutput(listOf(executable.absolutePath, "-version"))
+            ?: return null
+        return Regex("""version\s+"([^"]+)"""")
+            .find(output)
+            ?.groupValues
+            ?.getOrNull(1)
+    }
+
+    private fun commandVersion(command: String): String? =
+        commandOutput(listOf(command, "--version"))
+            ?.lineSequence()
+            ?.firstOrNull()
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
 
     private fun commandAvailable(command: String): Boolean =
+        commandSucceeds(listOf(command, "--version"))
+
+    private fun commandSucceeds(command: List<String>): Boolean =
         try {
-            val process = ProcessBuilder(command, "--version")
+            val process = ProcessBuilder(command)
                 .redirectErrorStream(true)
                 .start()
-            process.inputStream.close()
+            process.inputStream.bufferedReader().use { it.readText() }
             process.waitFor() == 0
         } catch (_: Exception) {
             false
         }
 
-    private fun printCompatibility(root: Project, runTask: Task?) {
-        root.logger.lifecycle("")
-        root.logger.lifecycle("Kanvas compatibility")
-        root.logger.lifecycle("--------------------")
+    private fun commandOutput(command: List<String>): String? =
+        try {
+            val process = ProcessBuilder(command)
+                .redirectErrorStream(true)
+                .start()
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            if (process.waitFor() == 0) output else null
+        } catch (_: Exception) {
+            null
+        }
 
-        if (runTask !is JavaExec) {
-            root.logger.lifecycle("No JavaExec desktop task selected.")
+    private fun composeRuntimeNames(runTask: JavaExec): List<String> =
+        runTask.classpath.files
+            .map { it.name }
+            .filter(::isComposeOrSkikoJar)
+            .sorted()
+
+    private fun isComposeOrSkikoJar(name: String): Boolean {
+        val lower = name.lowercase(Locale.ROOT)
+        return lower.contains("skiko") ||
+            lower.contains("compose") ||
+            lower.startsWith("runtime-desktop-") ||
+            lower.startsWith("ui-desktop-") ||
+            lower.startsWith("foundation-desktop-") ||
+            lower.startsWith("material-desktop-") ||
+            lower.startsWith("material3-desktop-")
+    }
+
+    private fun copyPackagedNotice(
+        home: File?,
+        destination: File,
+        name: String
+    ) {
+        val source = home?.let { File(it, name) }
+        val target = File(destination, name)
+
+        if (source?.isFile == true) {
+            source.copyTo(target, overwrite = true)
             return
         }
 
-        val names = runTask.classpath.files
-            .map { it.name }
-            .filter {
-                it.contains("compose", ignoreCase = true) ||
-                    it.contains("skiko", ignoreCase = true)
+        val resource = javaClass.getResourceAsStream("/kanvas/$name")
+            ?: return
+        resource.use { input ->
+            target.outputStream().use { output ->
+                input.copyTo(output)
             }
-            .sorted()
+        }
+    }
+
+    private fun printCompatibility(root: Project, runTask: Task?) {
+        root.logger.lifecycle("")
+        root.logger.lifecycle("Kanvas Compatibility Report")
+        root.logger.lifecycle("===========================")
+        root.logger.lifecycle("Gradle baseline : {} - {}", MIN_GRADLE, MAX_TESTED_GRADLE)
+        root.logger.lifecycle("Compose baseline: {}", BASELINE_COMPOSE)
+        root.logger.lifecycle("Skiko baseline  : {}", BASELINE_SKIKO)
+        root.logger.lifecycle("")
+
+        if (runTask !is JavaExec) {
+            root.logger.lifecycle("Run task        : not a JavaExec task")
+            root.logger.lifecycle("Result          : no Compose/Skiko runtime can be inspected")
+            root.logger.lifecycle("")
+            root.logger.lifecycle(
+                "This task reports detected runtime versions; it does not prove renderer compatibility."
+            )
+            return
+        }
+
+        root.logger.lifecycle("Run task        : {}", runTask.path)
+        val names = composeRuntimeNames(runTask)
 
         if (names.isEmpty()) {
-            root.logger.lifecycle("No Compose/Skiko jars found on the run classpath.")
+            root.logger.lifecycle("Detected        : no Compose/Skiko JARs on the run classpath")
         } else {
-            names.forEach { root.logger.lifecycle(it) }
+            names.forEach { root.logger.lifecycle("Detected        : {}", it) }
         }
+
+        val composeMatch = names.any {
+            it.contains(BASELINE_COMPOSE) &&
+                !it.contains("skiko", ignoreCase = true)
+        }
+        val skikoMatch = names.any {
+            it.contains(BASELINE_SKIKO) &&
+                it.contains("skiko", ignoreCase = true)
+        }
+
+        if (names.isNotEmpty()) {
+            root.logger.lifecycle(
+                "Compose status  : {}",
+                if (composeMatch) "baseline detected" else "version is unverified"
+            )
+            root.logger.lifecycle(
+                "Skiko status    : {}",
+                if (skikoMatch) "baseline detected" else "version is unverified"
+            )
+        }
+
+        root.logger.lifecycle("")
+        root.logger.lifecycle(
+            "This task reports detected runtime versions; it does not prove renderer compatibility."
+        )
+        root.logger.lifecycle(
+            "Use real application tests and strictRenderer for renderer verification."
+        )
     }
 }
