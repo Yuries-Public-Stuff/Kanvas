@@ -74,7 +74,10 @@ final class SkikoContextTransformer implements ClassFileTransformer {
                         protected void onMethodEnter() {
                             invokeStatic(
                                 Type.getObjectType(HOOKS),
-                                new Method("takeoverEnabled", "()Z")
+                                new Method(
+                                    "suppressSkikoPresentationPass",
+                                    "()Z"
+                                )
                             );
                             org.objectweb.asm.Label normal =
                                 new org.objectweb.asm.Label();
@@ -97,7 +100,7 @@ final class SkikoContextTransformer implements ClassFileTransformer {
             }
 
             System.err.println(
-                "[Kanvas] disabled legacy Skiko presentation pass"
+                "[Kanvas] installed Skiko presentation routing"
             );
             KanvasAgent.audit(
                 "TRANSFORMED_SKIKO_CONTEXT " +
