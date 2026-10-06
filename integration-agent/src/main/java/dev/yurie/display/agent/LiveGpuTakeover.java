@@ -275,6 +275,7 @@ final class LiveGpuTakeover {
     private static final AtomicBoolean PRESENT_PROVED = new AtomicBoolean();
     private static final AtomicBoolean RETAIN_PROVED = new AtomicBoolean();
     private static final AtomicBoolean TEXTURE_PROVED = new AtomicBoolean();
+    private static final AtomicBoolean PIXMAP_COLOR_PROVED = new AtomicBoolean();
     private static final AtomicBoolean GLYPH_ATLAS_PROVED = new AtomicBoolean();
     private static final Deque<State> stack = new ArrayDeque<>();
     private static final List<Command> commands = new ArrayList<>();
@@ -1795,6 +1796,78 @@ final class LiveGpuTakeover {
         return id;
     }
 
+    private static Object makeSrgbRasterSurface(
+        ClassLoader loader,
+        int width,
+        int height
+    ) throws Exception {
+        Class<?> surfaceClass =
+            Class.forName("org.jetbrains.skia.Surface", true, loader);
+        Class<?> imageInfoClass =
+            Class.forName("org.jetbrains.skia.ImageInfo", true, loader);
+        Class<?> colorTypeClass =
+            Class.forName("org.jetbrains.skia.ColorType", true, loader);
+        Class<?> alphaTypeClass =
+            Class.forName("org.jetbrains.skia.ColorAlphaType", true, loader);
+        Class<?> colorSpaceClass =
+            Class.forName("org.jetbrains.skia.ColorSpace", true, loader);
+
+        try {
+            Object bgra = colorTypeClass
+                .getField("BGRA_8888")
+                .get(null);
+            Object premul = alphaTypeClass
+                .getField("PREMUL")
+                .get(null);
+
+            Object colorSpaceCompanion =
+                colorSpaceClass.getField("Companion").get(null);
+            Object srgb = colorSpaceCompanion
+                .getClass()
+                .getMethod("getSRGB")
+                .invoke(colorSpaceCompanion);
+
+            Object info = imageInfoClass
+                .getConstructor(
+                    int.class,
+                    int.class,
+                    colorTypeClass,
+                    alphaTypeClass,
+                    colorSpaceClass
+                )
+                .newInstance(
+                    width,
+                    height,
+                    bgra,
+                    premul,
+                    srgb
+                );
+
+            Object surfaceCompanion =
+                surfaceClass.getField("Companion").get(null);
+            return surfaceCompanion
+                .getClass()
+                .getMethod("makeRaster", imageInfoClass)
+                .invoke(surfaceCompanion, info);
+        } catch (ReflectiveOperationException unavailable) {
+            /*
+             * Older Skiko lines may not expose the explicit ImageInfo surface
+             * constructor through the same JVM ABI. Keep them working with the
+             * historical native-N32 path.
+             */
+            Object companion =
+                surfaceClass.getField("Companion").get(null);
+            return companion
+                .getClass()
+                .getMethod(
+                    "makeRasterN32Premul",
+                    int.class,
+                    int.class
+                )
+                .invoke(companion, width, height);
+        }
+    }
+
     private static int pictureTextureIdForAddress(
         WindowContext context,
         int width,
@@ -1944,18 +2017,8 @@ final class LiveGpuTakeover {
         Object snapshot = null;
         try {
             ClassLoader loader = picture.getClass().getClassLoader();
-            Class<?> surfaceClass =
-                Class.forName("org.jetbrains.skia.Surface", true, loader);
-            Object companion =
-                surfaceClass.getField("Companion").get(null);
-            java.lang.reflect.Method makeRaster =
-                companion.getClass().getMethod(
-                    "makeRasterN32Premul",
-                    int.class,
-                    int.class
-                );
-            surface = makeRaster.invoke(
-                companion,
+            surface = makeSrgbRasterSurface(
+                loader,
                 frameWidth,
                 frameHeight
             );
@@ -2006,6 +2069,24 @@ final class LiveGpuTakeover {
             snapshot = invoke(surface, "makeImageSnapshot");
             Object pixmap = invoke(snapshot, "peekPixels");
             if (pixmap == null) return false;
+
+            if (PIXMAP_COLOR_PROVED.compareAndSet(false, true)) {
+                try {
+                    Object info = invoke(pixmap, "getInfo");
+                    Object colorType = invoke(info, "getColorType");
+                    Object alphaType = invoke(info, "getColorAlphaType");
+                    Object colorSpace = invoke(info, "getColorSpace");
+                    String proof =
+                        "PICTURE_PIXMAP_FORMAT colorType=" +
+                        String.valueOf(colorType) +
+                        " alphaType=" + String.valueOf(alphaType) +
+                        " colorSpace=" + String.valueOf(colorSpace);
+                    System.err.println("[Kanvas] " + proof);
+                    KanvasAgent.audit(proof);
+                } catch (Throwable ignored) {
+                    // Rendering must not depend on diagnostic reflection.
+                }
+            }
 
             long address =
                 ((Number)invoke(pixmap, "getAddr")).longValue();
