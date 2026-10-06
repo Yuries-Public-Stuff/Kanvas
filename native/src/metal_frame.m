@@ -567,7 +567,6 @@ void kd_metal_frame_destroy(kd_metal_frame *frame) {
     }
     if (!frame) return;
     @autoreleasepool {
-        [frame->queue insertDebugCaptureBoundary];
         frame->pipeline = nil;
         frame->clear_pipeline = nil;
         frame->texture_pipeline = nil;
