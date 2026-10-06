@@ -66,6 +66,32 @@ final class SkiaCanvasTransformer implements ClassFileTransformer {
                             )
                         );
 
+                        /*
+                         * Offscreen Skia canvases must run their original
+                         * methods untouched. Stop injecting takeover work
+                         * before any draw/transform hook can mutate the
+                         * primary frame state.
+                         */
+                        org.objectweb.asm.Label originalCanvas =
+                            new org.objectweb.asm.Label();
+                        invokeStatic(
+                            Type.getObjectType(HOOKS),
+                            new org.objectweb.asm.commons.Method(
+                                "canvasCallAllowed",
+                                "()Z"
+                            )
+                        );
+                        ifZCmp(EQ, originalCanvas);
+
+                        /*
+                         * Java returns below stop generation of additional
+                         * hook code for the current method. The finally block
+                         * still emits originalCanvas, so an offscreen Canvas
+                         * can jump over all Kanvas hooks and execute the
+                         * original Skia method body.
+                         */
+                        try {
+
                         if (name.equals("clear") && descriptor.equals("(I)Lorg/jetbrains/skia/Canvas;")) {
                             loadArg(0);
                             invokeStatic(Type.getObjectType(HOOKS),
@@ -544,21 +570,54 @@ final class SkiaCanvasTransformer implements ClassFileTransformer {
                                 ));
                         }
 
+                        } finally {
+                            mark(originalCanvas);
+                        }
                     }
 
                     private void returnCanvasWhenCaptured() {
-                        org.objectweb.asm.Label normal = new org.objectweb.asm.Label();
+                        org.objectweb.asm.Label mirror =
+                            new org.objectweb.asm.Label();
+                        org.objectweb.asm.Label normal =
+                            new org.objectweb.asm.Label();
+
+                        /*
+                         * Modern Skiko records Compose into PictureRecorder.
+                         * We mirror those calls into Kanvas but must let Skia
+                         * execute too, otherwise Compose's recording canvas
+                         * state/picture becomes invalid.
+                         *
+                         * The captured boolean is already on the stack here.
+                         */
+                        invokeStatic(
+                            Type.getObjectType(HOOKS),
+                            new org.objectweb.asm.commons.Method(
+                                "suppressOriginalCanvasCalls",
+                                "()Z"
+                            )
+                        );
+                        ifZCmp(EQ, mirror);
+
+                        // Legacy/direct mode: suppress only when Kanvas
+                        // actually captured the operation.
                         ifZCmp(EQ, normal);
                         loadThis();
                         returnValue();
+
+                        mark(mirror);
+                        pop();
                         mark(normal);
                     }
 
                     private void returnCanvasWhenTakeover() {
-                        org.objectweb.asm.Label normal = new org.objectweb.asm.Label();
+                        org.objectweb.asm.Label normal =
+                            new org.objectweb.asm.Label();
                         invokeStatic(
                             Type.getObjectType(HOOKS),
-                            new org.objectweb.asm.commons.Method("takeoverEnabled", "()Z")
+                            new org.objectweb.asm.commons.Method(
+                                "suppressOriginalCanvasCalls",
+                                "()Z"
+                            )
                         );
                         ifZCmp(EQ, normal);
                         loadThis();
