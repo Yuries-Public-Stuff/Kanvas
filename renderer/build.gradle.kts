@@ -1,3 +1,5 @@
+@file:Suppress("DEPRECATION")
+
 import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
 
 plugins {
@@ -18,7 +20,7 @@ kotlin {
     }
 
     sourceSets {
-        val nativeMain by creating {
+        val nativeMain = create("nativeMain") {
             dependsOn(commonMain.get())
         }
         commonTest.dependencies {
@@ -33,7 +35,7 @@ kotlin {
         compilations.getByName("main") {
             defaultSourceSet.dependsOn(nativeMainSourceSet)
             cinterops {
-                val kotlin_display by creating {
+                create("kotlin_display") {
                     definitionFile.set(project.file("src/nativeInterop/cinterop/kotlin_display.def"))
                     compilerOpts("-I${rootProject.projectDir}/native/include")
                 }
