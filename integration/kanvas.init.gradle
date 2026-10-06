@@ -15,6 +15,7 @@ def kanvasCapturePath = property("kanvas.capturePath", "kotlin.display.capturePa
 def kanvasCaptureSkiaCanvas = property("kanvas.capture", "kotlin.display.captureSkiaCanvas", "true")
 def kanvasStrictRenderer = property("kanvas.strictRenderer", "kotlin.display.strictDefaultRenderer", "false")
 def kanvasTakeover = property("kanvas.takeover", "kotlin.display.takeover", "true")
+def kanvasDev = property("kanvas.dev", "kotlin.display.dev", "false").toBoolean()
 
 if (kanvasHome == null || kanvasHome.trim().isEmpty()) {
     throw new GradleException("kanvas.home is required; use the Kanvas project adapter")
@@ -158,44 +159,431 @@ gradle.projectsEvaluated {
         return [kotlinProjects, composeProjects, appProjects]
     }
 
+
+    def commandOutput = { List<String> command ->
+        try {
+            def process = new ProcessBuilder(command)
+                .redirectErrorStream(true)
+                .start()
+            def output = process.inputStream.getText("UTF-8")
+            return process.waitFor() == 0 ? output.trim() : null
+        } catch (Exception ignored) {
+            return null
+        }
+    }
+
+    def commandVersion = { String command ->
+        def output = commandOutput([command, "--version"])
+        return output == null || output.isEmpty()
+            ? null
+            : output.readLines().first()
+    }
+
+    def fileVersion = { String name ->
+        def match = (name =~ /-(\d+(?:\.\d+)+(?:[-.][A-Za-z0-9]+)*)\.jar$/)
+        return match.find() ? match.group(1) : null
+    }
+
+    def addClasspathArtifact = { List rows, Project p, File file ->
+        def name = file.name
+        def lower = name.toLowerCase()
+        def version = fileVersion(name)
+        if (version == null) return
+
+        def group = null
+        def module = name.substring(0, name.length() - (version.length() + 5))
+        if (lower.contains("skiko")) {
+            group = "org.jetbrains.skiko"
+        } else if (lower.startsWith("runtime-desktop-")) {
+            group = "org.jetbrains.compose.runtime"
+        } else if (lower.startsWith("ui-desktop-") ||
+                   lower.startsWith("ui-graphics-desktop-") ||
+                   lower.startsWith("ui-text-desktop-")) {
+            group = "org.jetbrains.compose.ui"
+        } else if (lower.startsWith("foundation-desktop-")) {
+            group = "org.jetbrains.compose.foundation"
+        } else if (lower.startsWith("material-desktop-")) {
+            group = "org.jetbrains.compose.material"
+        } else if (lower.startsWith("material3-desktop-")) {
+            group = "org.jetbrains.compose.material3"
+        }
+
+        if (group != null) {
+            rows << [p.path, "javaExecRuntime", group, module, version]
+        }
+    }
+
     if (root.tasks.findByName("kanvasDoctor") == null) {
         root.tasks.register("kanvasDoctor") {
             group = "kanvas"
-            description = "Inspect this repository for Kanvas build/run integration."
+            description = "Diagnose this repository for Kanvas build/run integration."
             doLast {
                 def facts = projectFacts()
                 def buildTask = chooseBuild()
                 def runTask = chooseRun()
                 def packageTask = choosePackage()
-                println("")
-                println("Kanvas project adapter")
-                println("------------------------------")
-                println("Repository : " + root.projectDir)
-                println("Kanvas home: " + kanvasHome)
-                println("Backend    : " + kanvasBackend)
-                println("Kotlin     : " + (facts[0].isEmpty() ? "not detected" : facts[0]*.path.join(", ")))
-                println("Compose    : " + (facts[1].isEmpty() ? "not detected" : facts[1]*.path.join(", ")))
-                println("App/run    : " + (facts[2].isEmpty() ? "not detected" : facts[2]*.path.join(", ")))
-                println("Build task : " + buildTask.path)
-                println("Run task   : " + (runTask == null ? "not found" : runTask.path))
-                println("Package    : " + (packageTask == null ? "not found" : packageTask.path))
-                println("Audit      : " + (kanvasAgentJar.isEmpty() ? "off" : ("on -> " + kanvasAuditPath)))
-                println("Capture    : " + (kanvasCapturePath.isEmpty() ? "off" : kanvasCapturePath))
-                println("Strict     : " + kanvasStrictRenderer)
-                println("Takeover   : " + kanvasTakeover)
-                println("")
-                if (!facts[1].isEmpty()) {
-                    println("Compose project detected. Build/run task injection is active.")
-                    println("Run mode can intercept supported Skia Canvas draws and present them")
-                    println("through Kanvas' native GPU backend without editing the app.")
+                def checks = []
+                def ok = { name, detail -> checks << ["OK", name, detail, null] }
+                def warn = { name, detail, fix = null -> checks << ["WARN", name, detail, fix] }
+                def error = { name, detail, fix = null -> checks << ["ERROR", name, detail, fix] }
+
+                def osName = System.getProperty("os.name")
+                def os = osName.toLowerCase()
+                def arch = System.getProperty("os.arch")
+                def gradleJavaVersion = System.getProperty("java.version")
+                def activeJavaHome = new File(System.getProperty("java.home"))
+                def envJavaHomeText = System.getenv("JAVA_HOME")
+                def envJavaHome = envJavaHomeText == null || envJavaHomeText.trim().isEmpty()
+                    ? null
+                    : new File(envJavaHomeText)
+                def appJavaHome = envJavaHome ?: activeJavaHome
+                def jniHeader = new File(appJavaHome, "include/jni.h")
+                def appJavaVersion = null
+                try {
+                    def releaseFile = new File(appJavaHome, "release")
+                    if (releaseFile.isFile()) {
+                        def props = new Properties()
+                        releaseFile.withInputStream { props.load(it) }
+                        appJavaVersion = props.getProperty("JAVA_VERSION")?.replace('"', '')
+                    }
+                } catch (Exception ignored) {
+                    // Fall back to java -version below.
+                }
+                if (appJavaVersion == null) {
+                    def javaExe = new File(
+                        appJavaHome,
+                        os.contains("win") ? "bin/java.exe" : "bin/java"
+                    )
+                    if (javaExe.isFile()) {
+                        def versionText = commandOutput([javaExe.absolutePath, "-version"])
+                        def match = versionText == null ? null :
+                            (versionText =~ /version\s+"([^"]+)"/)
+                        if (match != null && match.find()) {
+                            appJavaVersion = match.group(1)
+                        }
+                    }
+                }
+
+                ok("Host", osName + " / " + arch)
+                ok("Gradle", gradle.gradleVersion)
+                ok(
+                    "Gradle JVM",
+                    gradleJavaVersion + " / " + activeJavaHome
+                )
+
+                if (!jniHeader.isFile()) {
+                    error(
+                        "App JDK/JNI",
+                        "JNI headers were not found under " + appJavaHome,
+                        "Use a full JDK 17+ and point JAVA_HOME at it."
+                    )
                 } else {
-                    println("Plain Kotlin project detected/accepted. Visual output uses Kanvas")
-                    println("only when the application routes drawing through the Kanvas runtime.")
+                    ok(
+                        "App JDK/JNI",
+                        (appJavaVersion ?: "version unknown") + " / " + appJavaHome +
+                        (envJavaHome == null ? " (active Gradle JVM)" : " (JAVA_HOME)")
+                    )
+                }
+
+                def home = new File(kanvasHome)
+                if (!new File(home, "native").isDirectory() ||
+                    !new File(home, "integration-agent").isDirectory()) {
+                    error(
+                        "Kanvas home",
+                        kanvasHome + " is not a complete Kanvas checkout.",
+                        "Use the Kanvas project adapter from a valid checkout."
+                    )
+                } else {
+                    ok("Kanvas home", kanvasHome)
+                }
+
+                def cmake = commandVersion("cmake")
+                if (cmake == null) {
+                    error("CMake", "not found", "Install CMake.")
+                } else {
+                    ok("CMake", cmake)
+                }
+
+                if (os.contains("mac")) {
+                    def clang = commandOutput(["xcrun", "--find", "clang"])
+                    if (clang == null) {
+                        error(
+                            "Xcode tools",
+                            "xcrun could not find clang.",
+                            "Run xcode-select --install."
+                        )
+                    } else {
+                        ok("Xcode tools", clang)
+                    }
+                    if (!(kanvasBackend in ["auto", "metal"])) {
+                        error(
+                            "Backend",
+                            kanvasBackend + " is not implemented on macOS.",
+                            "Use auto or metal."
+                        )
+                    } else {
+                        ok("Backend", kanvasBackend == "auto" ? "auto -> Metal" : "Metal")
+                    }
+                } else if (os.contains("linux")) {
+                    def x11 = commandOutput(["pkg-config", "--exists", "x11"])
+                    if (x11 == null && !new File("/usr/include/X11/Xlib.h").isFile()) {
+                        error(
+                            "X11 development",
+                            "X11 headers were not detected.",
+                            "Install the X11/Xlib development package."
+                        )
+                    } else {
+                        ok("X11 development", "detected")
+                    }
+                    if (!(kanvasBackend in ["auto", "vulkan"])) {
+                        error(
+                            "Backend",
+                            kanvasBackend + " is not implemented on Linux.",
+                            "Use auto or vulkan."
+                        )
+                    } else {
+                        ok("Backend", kanvasBackend == "auto" ? "auto -> Vulkan" : "Vulkan")
+                    }
+                } else if (os.contains("win")) {
+                    if (!(kanvasBackend in ["auto", "vulkan", "d3d9", "opengl", "gdi"])) {
+                        error(
+                            "Backend",
+                            kanvasBackend + " is not implemented on Windows.",
+                            "Use auto, vulkan, d3d9, opengl, or gdi."
+                        )
+                    } else {
+                        ok("Backend", kanvasBackend)
+                    }
+                } else {
+                    error("Host platform", osName + " is unsupported.", "Use Windows, macOS, or Linux.")
+                }
+
+                ok("Build task", buildTask.path)
+                if (runTask == null) {
+                    warn(
+                        "Run task",
+                        "No runnable JVM desktop task was found.",
+                        "Pass --run-task if this repository has a custom run task."
+                    )
+                } else if (!(runTask instanceof JavaExec)) {
+                    error(
+                        "Run task",
+                        runTask.path + " is not JavaExec.",
+                        "Select the JVM desktop JavaExec task."
+                    )
+                } else {
+                    ok("Run task", runTask.path)
+                }
+
+                if (packageTask == null) {
+                    warn("Package task", "No createDistributable task was found.")
+                } else {
+                    ok("Package task", packageTask.path)
+                }
+
+                ok(
+                    "Kotlin projects",
+                    facts[0].isEmpty() ? "not detected" : facts[0]*.path.join(", ")
+                )
+                if (facts[1].isEmpty()) {
+                    warn("Compose", "No Compose project was detected.")
+                } else {
+                    ok("Compose", facts[1]*.path.join(", "))
+                }
+
+                println("")
+                println("Kanvas Doctor")
+                println("=============")
+                println("Repository         : " + root.projectDir)
+                println("Requested backend : " + kanvasBackend)
+                println("Target            : " + (kanvasTarget.isEmpty() ? "auto" : kanvasTarget))
+                println("Takeover          : " + kanvasTakeover)
+                println("Capture           : " + kanvasCaptureSkiaCanvas)
+                println("Strict renderer   : " + kanvasStrictRenderer)
+                println("")
+                println("Checks")
+                println("------")
+                checks.each { row ->
+                    println("[" + row[0] + "] " + row[1] + ": " + row[2])
+                    if (row[3] != null) println("       Fix: " + row[3])
+                }
+
+                def errors = checks.count { it[0] == "ERROR" }
+                def warnings = checks.count { it[0] == "WARN" }
+                def passed = checks.count { it[0] == "OK" }
+                println("")
+                println(
+                    "Summary: " + errors + " error(s), " +
+                    warnings + " warning(s), " + passed + " check(s) passed."
+                )
+
+                if (errors > 0) {
+                    throw new GradleException(
+                        "Kanvas Doctor found " + errors + " blocking problem(s)."
+                    )
                 }
             }
         }
     }
 
+
+    def runCompatibilityProbe = { JavaExec runTask ->
+        if (kanvasAgentJar == null || kanvasAgentJar.trim().isEmpty()) {
+            return []
+        }
+
+        def agentFile = new File(kanvasAgentJar)
+        if (!agentFile.isFile()) {
+            return []
+        }
+
+        def os = System.getProperty("os.name").toLowerCase()
+        def javaHomeText = System.getenv("JAVA_HOME")
+        def javaHome = javaHomeText == null || javaHomeText.trim().isEmpty()
+            ? new File(System.getProperty("java.home"))
+            : new File(javaHomeText)
+        def javaExe = new File(
+            javaHome,
+            os.contains("win") ? "bin/java.exe" : "bin/java"
+        )
+        if (!javaExe.isFile()) {
+            return []
+        }
+
+        def cp = agentFile.absolutePath + File.pathSeparator + runTask.classpath.asPath
+        def command = [
+            javaExe.absolutePath,
+            "-cp",
+            cp,
+            "dev.yurie.display.agent.RuntimeCompatibilityProbe"
+        ]
+
+        try {
+            def process = new ProcessBuilder(command)
+                .redirectErrorStream(true)
+                .start()
+            def output = process.inputStream.getText("UTF-8")
+            def exit = process.waitFor()
+
+            def rows = []
+            output.readLines().findAll { line ->
+                line.startsWith("KANVAS_PROBE ")
+            }.each { line ->
+                def values = [:]
+                line.substring("KANVAS_PROBE ".length())
+                    .split(" ")
+                    .each { token ->
+                        def eq = token.indexOf("=")
+                        if (eq > 0) {
+                            def key = token.substring(0, eq)
+                            def value = token.substring(eq + 1)
+                                .replace("%20", " ")
+                                .replace("%0A", "\n")
+                                .replace("%0D", "\r")
+                            values[key] = value
+                        }
+                    }
+
+                if (values.status == "found" &&
+                    values.version != null &&
+                    values.version != "unknown") {
+                    def group
+                    def module
+                    switch (values.kind) {
+                        case "skiko":
+                            group = "org.jetbrains.skiko"
+                            module = "skiko-runtime"
+                            break
+                        case "compose-ui":
+                            group = "org.jetbrains.compose.ui"
+                            module = "ui-desktop"
+                            break
+                        case "compose-runtime":
+                            group = "org.jetbrains.compose.runtime"
+                            module = "runtime-desktop"
+                            break
+                        default:
+                            group = null
+                            module = null
+                    }
+
+                    if (group != null) {
+                        rows << [
+                            runTask.project.path,
+                            "runtimeProbe",
+                            group,
+                            module,
+                            values.version
+                        ]
+                    }
+                }
+            }
+
+            if (rows.isEmpty() && exit != 0) {
+                println(
+                    "Runtime compatibility probe could not resolve Compose/Skiko " +
+                    "from the selected app classpath (exit " + exit + ")."
+                )
+                output.readLines().findAll {
+                    it.startsWith("KANVAS_PROBE ")
+                }.each { println(it) }
+            }
+
+            return rows
+        } catch (Exception ex) {
+            println(
+                "Runtime compatibility probe failed: " +
+                ex.class.simpleName + ": " + ex.message
+            )
+            return []
+        }
+    }
+
+    def runtimeAuditCompatibility = { JavaExec runTask ->
+        def auditRoot = new File(kanvasHome, "build/external-audit")
+        if (!auditRoot.isDirectory()) return []
+
+        def prefix = root.projectDir.name + "-"
+        def candidates = auditRoot.listFiles()?.findAll { file ->
+            file.isFile() &&
+            file.name.startsWith(prefix) &&
+            file.name.endsWith(".log")
+        }?.sort { a, b -> b.lastModified() <=> a.lastModified() } ?: []
+
+        if (candidates.isEmpty()) return []
+
+        def latest = candidates.first()
+        def rows = []
+
+        latest.eachLine { line ->
+            if (!line.startsWith("RUNTIME_SOURCE ")) return
+
+            def marker = " source="
+            def index = line.indexOf(marker)
+            if (index < 0) return
+
+            def source = line.substring(index + marker.length()).trim()
+            try {
+                def uri = new URI(source)
+                if (!"file".equalsIgnoreCase(uri.scheme)) return
+                def file = new File(uri)
+                addClasspathArtifact(rows, runTask.project, file)
+            } catch (Exception ignored) {
+                // Ignore malformed/stale source entries.
+            }
+        }
+
+        if (kanvasDev) {
+            println(
+                "[dev] runtime audit compatibility source: " +
+                latest.absolutePath + " (" + rows.size() + " match(es))"
+            )
+        }
+
+        return rows.collect { row ->
+            [row[0], "runtimeAudit", row[2], row[3], row[4]]
+        }
+    }
 
     if (root.tasks.findByName("kanvasCompatibility") == null) {
         root.tasks.register("kanvasCompatibility") {
@@ -203,35 +591,75 @@ gradle.projectsEvaluated {
             description = "Report Compose/Skiko dependencies relevant to renderer replacement."
             doLast {
                 def rows = []
+                def scannedConfigurations = 0
+                def resolvedArtifactFiles = 0
+
                 root.allprojects.each { p ->
-                    p.configurations.findAll { cfg ->
-                        cfg.canBeResolved && (
-                            cfg.name.toLowerCase().contains("runtimeclasspath") ||
-                            cfg.name.toLowerCase().contains("compileclasspath")
-                        )
-                    }.each { cfg ->
-                        try {
-                            cfg.incoming.resolutionResult.allComponents.each { component ->
-                                def id = component.moduleVersion
-                                if (id == null) return
-                                def group = id.group ?: ""
-                                if (group.startsWith("org.jetbrains.compose") ||
-                                    group.startsWith("org.jetbrains.skiko") ||
-                                    group.startsWith("androidx.compose")) {
-                                    rows << [p.path, cfg.name, group, id.name, id.version]
+                    p.configurations.each { cfg ->
+                        if (!cfg.canBeResolved) return
+
+                        def lowerName = cfg.name.toLowerCase()
+                        def jvmRelevant =
+                            lowerName.contains("runtime") ||
+                            lowerName.contains("compile") ||
+                            lowerName.contains("desktop") ||
+                            lowerName.contains("jvm")
+                        if (jvmRelevant) {
+                            try {
+                                scannedConfigurations++
+
+                                // Source 1: Gradle dependency metadata.
+                                cfg.incoming.resolutionResult.allComponents.each { component ->
+                                    def id = component.moduleVersion
+                                    if (id != null) {
+                                        def group = id.group ?: ""
+                                        if (group.startsWith("org.jetbrains.compose") ||
+                                            group.startsWith("org.jetbrains.skiko") ||
+                                            group.startsWith("androidx.compose")) {
+                                            rows << [p.path, cfg.name, group, id.name, id.version]
+                                        }
+                                    }
                                 }
+
+                                // Source 2: actual resolved JAR filenames. This catches
+                                // variant/configuration layouts where module metadata does
+                                // not surface the desktop artifact the way we expect.
+                                cfg.files.each { file ->
+                                    resolvedArtifactFiles++
+                                    addClasspathArtifact(rows, p, file)
+
+                                    def normalized = file.absolutePath.replace('\\', '/')
+                                    def marker = "/modules-2/files-2.1/"
+                                    def markerIndex = normalized.indexOf(marker)
+                                    if (markerIndex >= 0) {
+                                        def tail = normalized.substring(markerIndex + marker.length())
+                                        def parts = tail.split('/')
+                                        if (parts.length >= 3) {
+                                            def group = parts[0]
+                                            def name = parts[1]
+                                            def version = parts[2]
+                                            if (group.startsWith("org.jetbrains.compose") ||
+                                                group.startsWith("org.jetbrains.skiko") ||
+                                                group.startsWith("androidx.compose")) {
+                                                rows << [p.path, cfg.name, group, name, version]
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch (Exception ignored) {
+                                // Host-incompatible/native-only configurations are expected.
                             }
-                        } catch (Exception ignored) {
-                            // Skip host-incompatible configurations.
                         }
                     }
                 }
 
-                // Check the selected JavaExec runtime classpath too.
+                // Source 3: the exact JavaExec classpath that will launch the app.
                 try {
                     def runTask = chooseRun()
                     if (runTask instanceof JavaExec) {
                         runTask.classpath.files.each { file ->
+                            addClasspathArtifact(rows, runTask.project, file)
+
                             def normalized = file.absolutePath.replace('\\', '/')
                             def marker = "/modules-2/files-2.1/"
                             def markerIndex = normalized.indexOf(marker)
@@ -245,14 +673,71 @@ gradle.projectsEvaluated {
                                     if (group.startsWith("org.jetbrains.compose") ||
                                         group.startsWith("org.jetbrains.skiko") ||
                                         group.startsWith("androidx.compose")) {
-                                        rows << [runTask.project.path, "javaExecRuntime", group, name, version]
+                                        rows << [
+                                            runTask.project.path,
+                                            "javaExecRuntime",
+                                            group,
+                                            name,
+                                            version
+                                        ]
                                     }
                                 }
                             }
                         }
                     }
                 } catch (Exception ignored) {
-                    // Ignore non-JavaExec lookup failures.
+                    // Keep the report useful even when the selected run task is unusual.
+                }
+
+                // Source 4: ask the actual JVM/classpath what it can load.
+                try {
+                    def runTask = chooseRun()
+                    if (runTask instanceof JavaExec) {
+                        rows.addAll(runCompatibilityProbe(runTask))
+                    }
+                } catch (Exception ignored) {
+                    // Static sources above remain available as fallback.
+                }
+
+                // Source 5: latest real application run. The agent records
+                // CodeSource URLs for renderer classes, which is authoritative
+                // when Gradle's static task/configuration model hides the jars.
+                try {
+                    def runTask = chooseRun()
+                    if (runTask instanceof JavaExec) {
+                        rows.addAll(runtimeAuditCompatibility(runTask))
+                    }
+                } catch (Exception ignored) {
+                    // No prior runtime audit is fine.
+                }
+
+                if (kanvasDev) {
+                    try {
+                        def runTask = chooseRun()
+                        if (runTask instanceof JavaExec) {
+                            println("[dev] selected run task: " + runTask.path)
+                            def devJavaHome = System.getenv("JAVA_HOME")
+                            def effectiveJava = runTask.executable
+                            if (devJavaHome != null && !devJavaHome.trim().isEmpty()) {
+                                def candidate = new File(
+                                    devJavaHome,
+                                    System.getProperty("os.name").toLowerCase().contains("win")
+                                        ? "bin/java.exe"
+                                        : "bin/java"
+                                )
+                                if (candidate.isFile()) {
+                                    effectiveJava = candidate.absolutePath
+                                }
+                            }
+                            println("[dev] effective Kanvas JVM: " + effectiveJava)
+                            println("[dev] raw JavaExec executable: " + runTask.executable)
+                            println("[dev] classpath: runtime audit/probe used; not force-resolved here")
+                            println("[dev] JVM args: " + (runTask.jvmArgs ?: []))
+                            println("[dev] main class: " + runTask.mainClass.orNull)
+                        }
+                    } catch (Exception ex) {
+                        println("[dev] run task inspection failed: " + ex)
+                    }
                 }
 
                 rows = rows.unique().sort { a, b ->
@@ -262,8 +747,20 @@ gradle.projectsEvaluated {
                 println("Kanvas Compose compatibility report")
                 println("-------------------------------------------")
                 if (rows.isEmpty()) {
-                    println("No resolved Compose/Skiko desktop dependencies were found.")
+                    println("No Compose/Skiko desktop dependencies were detected.")
+                    println(
+                        "Scanned " + scannedConfigurations +
+                        " JVM/desktop Gradle configuration(s) and " +
+                        resolvedArtifactFiles + " resolved artifact file(s)."
+                    )
+                    println(
+                        "The live agent will still verify the renderer ABI at runtime."
+                    )
                 } else {
+                    println(
+                        "Detected " + rows.size() +
+                        " Compose/Skiko dependency record(s) from Gradle metadata/artifacts/runtime probe."
+                    )
                     rows.each { row ->
                         println(row[0] + " [" + row[1] + "] " + row[2] + ":" + row[3] + ":" + row[4])
                     }
@@ -282,23 +779,25 @@ gradle.projectsEvaluated {
                 }.collect { it[4] }.findAll { it != null }.unique()
 
                 println("")
-                println("Live takeover capabilities")
-                println("--------------------------")
-                println("Canvas: clear, rect/rrect/drrect, oval/circle, points/lines/polygons,")
-                println("        arcs, paths/regions, drawPaint, images/image-nine, clipping,")
-                println("        save/layers, affine transforms and matrix state")
-                println("Text  : Paragraph.paint interception, styled runs, wrapping and Unicode")
-                println("Paint : solid RGBA, captured gradients, captured drop-shadow image filters")
-                println("Input : resize, left/right/middle pointer, move, wheel/trackpad, keyboard,")
-                println("        modifiers, Windows IME/Unicode and per-window/dialog routing")
-                println("Host  : per-Compose-window native GPU takeover; original AWT windows are")
-                println("        kept alive off-screen for Compose state/layout/input")
-                println("")
-                println("Strict-mode traps still reported deterministically at runtime:")
-                println("  custom/unknown shaders, color filters, path effects, mask filters,")
-                println("  custom blenders/non-SRC_OVER modes, backdrop filters, and Canvas")
-                println("  operations not explicitly intercepted by the installed Skiko API.")
-                println("")
+                if (kanvasDev) {
+                    println("Live takeover capabilities")
+                    println("--------------------------")
+                    println("Canvas: clear, rect/rrect/drrect, oval/circle, points/lines/polygons,")
+                    println("        arcs, paths/regions, drawPaint, images/image-nine, clipping,")
+                    println("        save/layers, affine transforms and matrix state")
+                    println("Text  : Paragraph.paint interception, styled runs, wrapping and Unicode")
+                    println("Paint : solid RGBA, captured gradients, captured drop-shadow image filters")
+                    println("Input : resize, left/right/middle pointer, move, wheel/trackpad, keyboard,")
+                    println("        modifiers, Windows IME/Unicode and per-window/dialog routing")
+                    println("Host  : per-Compose-window native GPU takeover; original AWT windows are")
+                    println("        kept alive off-screen for Compose state/layout/input")
+                    println("")
+                    println("Strict-mode traps still reported deterministically at runtime:")
+                    println("  custom/unknown shaders, color filters, path effects, mask filters,")
+                    println("  custom blenders/non-SRC_OVER modes, backdrop filters, and Canvas")
+                    println("  operations not explicitly intercepted by the installed Skiko API.")
+                    println("")
+                }
                 println("Source-verified Skiko interception ABIs: 0.9.4.2, 0.144.6")
                 println("Source-verified Compose renderer lines: 1.8.2, 1.11.1")
                 println("Detected Compose versions: " +
@@ -334,7 +833,10 @@ gradle.projectsEvaluated {
                     }
 
                     if (rendererComposeVersions.isEmpty() || skikoVersions.isEmpty()) {
-                        println("Runtime renderer versions will be verified by the live agent.")
+                        println(
+                            "Static compatibility detection is incomplete; " +
+                            "the live agent must verify the renderer ABI at runtime."
+                        )
                     }
                 }
             }
