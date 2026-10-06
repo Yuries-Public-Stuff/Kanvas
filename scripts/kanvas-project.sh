@@ -15,6 +15,7 @@ AUDIT_RENDERER=1
 STRICT_RENDERER=0
 SKIP_RUNTIME=0
 CLEAN_TARGET=0
+DEV_MODE=0
 
 usage() {
   cat <<'EOF'
@@ -38,6 +39,7 @@ Options:
   --no-audit-renderer     Disable the renderer ownership audit
   --strict-renderer       Fail if any unsupported draw escapes GPU takeover
   --skip-runtime          Do not prebuild Kanvas host artifacts
+  --dev                   Verbose diagnostics: full warnings, stacktraces, probe/classpath details
   -h, --help              Show help
 
 The external repository is not edited. Integration is injected with a Gradle
@@ -64,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --strict-renderer) AUDIT_RENDERER=1; STRICT_RENDERER=1 ;;
     --clean-target) CLEAN_TARGET=1 ;;
     --skip-runtime) SKIP_RUNTIME=1 ;;
+    --dev) DEV_MODE=1 ;;
     -h|--help) usage; exit 0 ;;
     -*)
       echo "Unknown option: $1"
@@ -141,7 +144,7 @@ run_gradle() {
   fi
 }
 
-if [[ $SKIP_RUNTIME -eq 0 ]]; then
+if [[ $SKIP_RUNTIME -eq 0 && "$MODE" != "doctor" && "$MODE" != "compat" ]]; then
   "$KANVAS_ROOT/scripts/build-runtime.sh" \
     --gradle-launcher "$GRADLE"
 fi
@@ -150,10 +153,11 @@ COMMON=(
   "-I" "$INIT_SCRIPT"
   "-Dkanvas.home=$KANVAS_ROOT"
   "-Dkanvas.backend=$BACKEND"
+  "-Dkanvas.dev=$([[ $DEV_MODE -eq 1 ]] && echo true || echo false)"
 )
 
 NEEDS_AGENT=0
-if [[ "$MODE" == "package" ]]; then
+if [[ "$MODE" == "package" || "$MODE" == "compat" ]]; then
   NEEDS_AGENT=1
 elif [[ "$MODE" == "run" && $AUDIT_RENDERER -eq 1 ]]; then
   NEEDS_AGENT=1
@@ -169,11 +173,18 @@ if [[ $NEEDS_AGENT -eq 1 ]]; then
   fi
 
   AGENT_JAR="$KANVAS_ROOT/integration-agent/build/libs/kanvas-agent.jar"
-  if [[ ! -f "$AGENT_JAR" ]]; then
-    if [[ -x "$KANVAS_GRADLE" ]]; then
-      "$KANVAS_GRADLE" -p "$KANVAS_ROOT" :integration-agent:jar
+  if [[ "$MODE" == "compat" || ! -f "$AGENT_JAR" ]]; then
+    AGENT_GRADLE_ARGS=(-p "$KANVAS_ROOT" :integration-agent:jar)
+    if [[ $DEV_MODE -eq 1 ]]; then
+      AGENT_GRADLE_ARGS+=(--warning-mode all --stacktrace)
     else
-      bash "$KANVAS_GRADLE" -p "$KANVAS_ROOT" :integration-agent:jar
+      AGENT_GRADLE_ARGS+=(--quiet --warning-mode none)
+    fi
+
+    if [[ -x "$KANVAS_GRADLE" ]]; then
+      "$KANVAS_GRADLE" "${AGENT_GRADLE_ARGS[@]}"
+    else
+      bash "$KANVAS_GRADLE" "${AGENT_GRADLE_ARGS[@]}"
     fi
   fi
   if [[ ! -f "$AGENT_JAR" ]]; then
@@ -227,4 +238,9 @@ echo "Backend: $BACKEND"
 [[ -n "$TARGET_PROJECT" ]] && echo "Project: $TARGET_PROJECT"
 echo
 
-run_gradle "${COMMON[@]}" "$TASK" --stacktrace --no-configuration-cache
+if [[ $DEV_MODE -eq 1 ]]; then
+  echo "Dev mode: verbose Gradle/probe diagnostics enabled"
+  run_gradle "${COMMON[@]}" "$TASK"     --stacktrace     --warning-mode all     --info     --no-configuration-cache
+else
+  run_gradle "${COMMON[@]}" "$TASK"     --warning-mode none     --console plain     --no-configuration-cache
+fi
