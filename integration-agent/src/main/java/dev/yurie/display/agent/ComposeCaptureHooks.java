@@ -22,6 +22,8 @@ public final class ComposeCaptureHooks {
     private static final ThreadLocal<Object> FRAME_CANVAS = new ThreadLocal<>();
     private static final ThreadLocal<Boolean> CANVAS_CALL_ALLOWED =
         new ThreadLocal<>();
+    private static final ThreadLocal<Boolean> MIRROR_ORIGINAL_CANVAS =
+        ThreadLocal.withInitial(() -> false);
 
     private static volatile String capturePath = "";
     private static volatile boolean enabled;
@@ -30,6 +32,7 @@ public final class ComposeCaptureHooks {
     private static volatile boolean requestedStrict;
     private static volatile boolean canvasTransformerReady;
     private static volatile boolean frameTransformerReady;
+    private static volatile boolean modernSkikoDrawBoundary;
 
     private ComposeCaptureHooks() {}
 
@@ -57,6 +60,62 @@ public final class ComposeCaptureHooks {
         armTakeoverIfReady();
     }
 
+    static synchronized void markModernSkikoDrawBoundary() {
+        modernSkikoDrawBoundary = true;
+    }
+
+    public static boolean suppressSkikoPresentationPass() {
+        return LiveGpuTakeover.enabled() && !modernSkikoDrawBoundary;
+    }
+
+    static synchronized void markFrameTransformerFailed(String detail) {
+        frameTransformerReady = false;
+        KanvasAgent.audit("FRAME_TRANSFORMER_UNAVAILABLE " + detail);
+        if (requestedTakeover && requestedStrict) {
+            System.err.println(
+                "[Kanvas] strict takeover cannot establish frame boundaries: " +
+                detail
+            );
+            Runtime.getRuntime().halt(88);
+        }
+    }
+
+    public static void frameStartLayerRecording(
+        Object layer,
+        long nanoTime,
+        Object forcedSize
+    ) {
+        MIRROR_ORIGINAL_CANVAS.set(true);
+        if (layer == null) return;
+
+        if (forcedSize != null) {
+            try {
+                Method getWidth = method(forcedSize.getClass(), "getWidth");
+                Method getHeight = method(forcedSize.getClass(), "getHeight");
+                if (getWidth != null && getHeight != null) {
+                    int width = Math.max(
+                        0,
+                        (int)Math.round(
+                            ((Number)getWidth.invoke(forcedSize)).doubleValue()
+                        )
+                    );
+                    int height = Math.max(
+                        0,
+                        (int)Math.round(
+                            ((Number)getHeight.invoke(forcedSize)).doubleValue()
+                        )
+                    );
+                    frameStart(layer, width, height, nanoTime);
+                    return;
+                }
+            } catch (ReflectiveOperationException ignored) {
+                // Fall through to layer-based sizing.
+            }
+        }
+
+        frameStartLayer(layer, nanoTime);
+    }
+
     private static void armTakeoverIfReady() {
         if (requestedTakeover && canvasTransformerReady && frameTransformerReady) {
             LiveGpuTakeover.configure(true, requestedStrict);
@@ -69,7 +128,12 @@ public final class ComposeCaptureHooks {
         return LiveGpuTakeover.enabled();
     }
 
+    public static boolean suppressOriginalCanvasCalls() {
+        return LiveGpuTakeover.enabled() && !MIRROR_ORIGINAL_CANVAS.get();
+    }
+
     public static void frameStartLayer(Object layer, long nanoTime) {
+        MIRROR_ORIGINAL_CANVAS.set(false);
         if (layer == null) return;
         try {
             Method getWidth = method(layer.getClass(), "getWidth");
@@ -134,16 +198,25 @@ public final class ComposeCaptureHooks {
             CANVAS_CALL_ALLOWED.remove();
             FRAME_CANVAS.remove();
             FRAME_CAPTURE_ACTIVE.set(false);
+            MIRROR_ORIGINAL_CANVAS.remove();
         }
     }
 
-    // Capture only the main frame canvas, not Skia offscreen canvases.
+    // Legacy direct-draw mode captures one primary canvas. Modern Skiko
+    // recording mode uses nested PictureRecorder canvases for real Compose
+    // content, so every canvas participating while the frame is active must
+    // be mirrored into Kanvas.
     public static boolean captureCanvas(Object canvas) {
         if (canvas == null ||
             !FRAME_CAPTURE_ACTIVE.get() ||
             !LiveGpuTakeover.isConfigured()) {
             CANVAS_CALL_ALLOWED.set(false);
             return false;
+        }
+
+        if (MIRROR_ORIGINAL_CANVAS.get()) {
+            CANVAS_CALL_ALLOWED.set(true);
+            return true;
         }
 
         Object key = canvasIdentity(canvas);
@@ -205,7 +278,7 @@ public final class ComposeCaptureHooks {
         captureCanvas(canvas);
     }
 
-    static boolean canvasCallAllowed() {
+    public static boolean canvasCallAllowed() {
         Boolean allowed = CANVAS_CALL_ALLOWED.get();
         return allowed == null || allowed;
     }
