@@ -1,3 +1,4 @@
+import org.gradle.api.publish.maven.MavenPublication
 import org.gradle.plugin.compatibility.compatibility
 
 plugins {
@@ -6,7 +7,11 @@ plugins {
 }
 
 group = "org.yurie.kanvas"
-version = providers.gradleProperty("kanvasVersion").orElse("0.1.0-SNAPSHOT").get()
+version = providers.gradleProperty("kanvasVersion").orElse("0.1.0").get()
+
+base {
+    archivesName.set("kanvas")
+}
 
 kotlin {
     jvmToolchain(17)
@@ -50,6 +55,12 @@ gradlePlugin {
 }
 
 publishing {
+    publications.withType<MavenPublication>().configureEach {
+        if (name == "pluginMaven") {
+            artifactId = "kanvas"
+        }
+    }
+
     repositories {
         maven {
             name = "kanvasBuild"
