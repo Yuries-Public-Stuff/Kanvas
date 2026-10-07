@@ -2,9 +2,11 @@
 
 This file tracks notable user-facing Kanvas changes.
 
-Kanvas is still pre-release, so the current section remains **Unreleased** until the first version is intentionally cut.
+Kanvas follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
+
+## 0.1.0 - 2026-10-06
 
 ### Added
 
